@@ -1,26 +1,30 @@
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { PlaywrightCrawler, Dataset, sleep } from 'crawlee';
 import { load as loadCheerio } from 'cheerio';
+import got from 'got-scraping';
 
 const BASE_URL = 'https://jooble.org';
-const DETAIL_BATCH_SIZE_DEFAULT = 6;     // concurrent job detail tabs
-const MAX_RETRIES = 2;                   // per URL (search page) retries
+const DETAIL_BATCH = 5;
+const MAX_RETRIES = 2;
 
-// --- Helpers ----------------------------------------------------
-
-function extractJobLinks(html, baseUrl) {
-    const $ = loadCheerio(html);
-    const links = new Set();
-    // multiple patterns to be robust to markup changes
-    $('a[href*="/desc/"], a[data-qa="vacancy-serp__vacancy-title"], a[class*="job-link"], a[class*="position-link"]').each((_, el) => {
-        const href = $(el).attr('href');
-        if (!href) return;
-        const abs = href.startsWith('http') ? href : new URL(href, baseUrl).href;
-        if (abs.includes('/desc/')) links.add(abs);
-    });
-    return [...links];
+// --- helpers ------------------------------------------------------
+function randomUA() {
+    const UAS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36',
+    ];
+    return UAS[Math.floor(Math.random() * UAS.length)];
 }
-
+function extractJobLinks(html, base) {
+    const $ = loadCheerio(html);
+    const set = new Set();
+    $('a[href*="/desc/"]').each((_, el) => {
+        const href = $(el).attr('href');
+        if (href) set.add(href.startsWith('http') ? href : new URL(href, base).href);
+    });
+    return [...set];
+}
 async function extractJobData(page, url) {
     const job = {
         title: '',
@@ -31,41 +35,39 @@ async function extractJobData(page, url) {
         job_url: url,
         scrapedAt: new Date().toISOString(),
     };
-
     try {
-        // Quick text selectors; tolerate missing nodes
         job.title = (await page.textContent('h1, .job-title, .vacancy-title').catch(() => ''))?.trim() || '';
         job.company = (await page.textContent('.company, .employer, .company-name').catch(() => ''))?.trim() || '';
         job.location = (await page.textContent('.location, .job-location').catch(() => ''))?.trim() || '';
         job.salary = (await page.textContent('.salary, .compensation').catch(() => ''))?.trim() || '';
-        job.description = (await page.textContent('.job-description, .vacancy-description, main, article').catch(() => ''))?.trim().slice(0, 4000) || '';
-    } catch (err) {
-        log.warning(`⚠️ Error parsing ${url}: ${err.message}`);
-    }
+        job.description =
+            (await page.textContent('.job-description, main, article').catch(() => ''))?.trim().slice(0, 4000) || '';
+    } catch {}
     return job;
 }
-
-function chunk(arr, size) {
+function chunk(arr, n) {
     const out = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
     return out;
 }
 
-// --- Main -------------------------------------------------------
+// --- optional: auto-fetch consent cookie --------------------------
+async function getConsentCookie() {
+    try {
+        const res = await got(`${BASE_URL}/SearchResult?ukw=test`, { timeout: 8000 });
+        const cookie = (res.headers['set-cookie'] || []).find(c => c.includes('consent'));
+        if (cookie) log.info('✅ Fetched consent cookie');
+        return cookie?.split(';')[0];
+    } catch {
+        log.warning('⚠️ Consent cookie fetch failed');
+        return null;
+    }
+}
 
+// --- main ---------------------------------------------------------
 await Actor.init();
-
 const input = (await Actor.getInput()) || {};
-const {
-    searchQuery = 'developer',
-    maxPages = 3,
-    maxItems = 30,
-    fastMode = true,                          // true => Apify shared proxy; false => RESIDENTIAL
-    detailConcurrency = DETAIL_BATCH_SIZE_DEFAULT,
-    navTimeoutSecs = 15,                      // navigation timeout per page
-} = input;
-
-log.info(`🎬 Jooble scraper started | query="${searchQuery}" maxPages=${maxPages} maxItems=${maxItems}`);
+const { searchQuery = 'developer', maxPages = 3, maxItems = 20, fastMode = true } = input;
 
 const proxyConfiguration = await Actor.createProxyConfiguration({
     useApifyProxy: true,
@@ -73,136 +75,107 @@ const proxyConfiguration = await Actor.createProxyConfiguration({
 });
 log.info('✅ Proxy configured');
 
+const consentCookie = await getConsentCookie();
 let saved = 0;
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
-    maxRequestsPerCrawl: Math.max(50, maxPages * 20),
-    navigationTimeoutSecs: navTimeoutSecs,
+    navigationTimeoutSecs: 20,
     requestHandlerTimeoutSecs: 45,
+    maxRequestsPerCrawl: maxPages * 20,
     useSessionPool: true,
+    sessionPoolOptions: { maxPoolSize: 20, sessionOptions: { maxUsageCount: 3 } },
 
     launchContext: {
         launchOptions: {
             headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-gpu',
-            ],
+            args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
         },
     },
 
-    // Must be an array in Crawlee 3.15.x
     preNavigationHooks: [
-        async ({ page }) => {
-            // Block heavy resources to speed up loads
-            await page.route('**/*', (route) => {
-                const type = route.request().resourceType();
-                if (['image', 'stylesheet', 'font', 'media'].includes(type)) route.abort();
+        async ({ page, session }) => {
+            // resource blocking
+            await page.route('**/*', route => {
+                const t = route.request().resourceType();
+                if (['image', 'stylesheet', 'font', 'media'].includes(t)) route.abort();
                 else route.continue();
             });
-            // simple stealth tweaks
+            // stealth
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
             });
-            await page.setViewportSize({ width: 1366, height: 768 });
+            // rotating UA & cookie
+            const ua = randomUA();
+            await page.setUserAgent(ua);
+            if (consentCookie) await page.context().addCookies([{ name: 'consent', value: 'true', domain: 'jooble.org' }]);
         },
     ],
 
-    async requestHandler(ctx) {
-        const { page, request, crawler, session } = ctx;
+    async requestHandler({ page, request, crawler, session }) {
         const label = request.userData?.label || 'SEARCH';
         const pageNum = request.userData?.page || 1;
-        const retries = request.userData?.retries || 0;
 
-        // --- Robust navigation with timeout + retry wiring
         try {
-            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: navTimeoutSecs * 1000 });
-        } catch (err) {
-            log.warning(`⏱️ Nav timeout on ${request.url} (try ${retries + 1}/${MAX_RETRIES + 1}): ${err.message}`);
+            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        } catch (e) {
+            log.warning(`⏱️ Timeout on ${request.url}`);
             session.retire();
-            if (retries < MAX_RETRIES) {
-                await crawler.addRequests([{ url: request.url, userData: { ...request.userData, retries: retries + 1 } }]);
-            } else {
-                log.error(`❌ Gave up on ${request.url} after ${retries + 1} tries`);
-            }
-            return;
+            throw e;
         }
 
         const html = await page.content();
-        if (/captcha|verify|are you human|before you continue/i.test(html)) {
-            log.warning(`🚧 Bot/consent wall on ${request.url}`);
+        if (/captcha|verify|are you human|403 Forbidden/i.test(html)) {
+            log.warning(`🚧 Blocked at ${request.url}`);
             session.retire();
-            if (retries < MAX_RETRIES) {
-                await crawler.addRequests([{ url: request.url, userData: { ...request.userData, retries: retries + 1 } }]);
-            }
-            return;
+            throw new Error('Blocked');
         }
 
-        // --- SEARCH PAGE ---
         if (label === 'SEARCH') {
             const jobLinks = extractJobLinks(html, request.url);
-            log.info(`🔎 Page ${pageNum}: found ${jobLinks.length} job links`);
-
-            if (!jobLinks.length) {
-                log.warning(`⚠️ No jobs on ${request.url}`);
-            } else {
-                const limited = jobLinks.slice(0, Math.max(0, maxItems - saved));
-                const batches = chunk(limited, Math.max(1, detailConcurrency));
-
-                for (const batch of batches) {
-                    // Process a batch of detail tabs in parallel
-                    await Promise.allSettled(batch.map(async (jobUrl) => {
-                        const detailPage = await crawler.browserPool.newPage();
+            log.info(`🔎 Page ${pageNum}: ${jobLinks.length} job links`);
+            const limited = jobLinks.slice(0, maxItems - saved);
+            for (const group of chunk(limited, DETAIL_BATCH)) {
+                await Promise.allSettled(
+                    group.map(async url => {
+                        const detail = await crawler.browserPool.newPage();
                         try {
-                            await detailPage.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: navTimeoutSecs * 1000 });
-                            const data = await extractJobData(detailPage, jobUrl);
+                            await detail.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                            const data = await extractJobData(detail, url);
                             if (data.title) {
                                 await Dataset.pushData(data);
                                 saved++;
                                 log.info(`✅ [${saved}] ${data.title}`);
                             }
-                        } catch (e) {
-                            log.warning(`❌ Detail failed: ${jobUrl} | ${e.message}`);
+                        } catch (err) {
+                            log.warning(`❌ Detail failed ${url}: ${err.message}`);
                         } finally {
-                            await detailPage.close().catch(() => {});
+                            await detail.close().catch(() => {});
                         }
-                    }));
-
-                    if (saved >= maxItems) {
-                        log.info(`🎯 Reached maxItems (${maxItems}).`);
-                        break;
-                    }
-                    // short human-like pause between batches
-                    await Actor.sleep(600 + Math.random() * 400);
-                }
+                    })
+                );
+                await sleep(800 + Math.random() * 500);
+                if (saved >= maxItems) return;
             }
 
-            // Queue next result page
             if (pageNum < maxPages && saved < maxItems) {
-                const nextUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}&p=${pageNum + 1}`;
-                await crawler.addRequests([{ url: nextUrl, userData: { label: 'SEARCH', page: pageNum + 1 } }]);
-                log.info(`📄 Queued next page ${pageNum + 1}`);
+                const next = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}&p=${pageNum + 1}`;
+                await crawler.addRequests([{ url: next, userData: { label: 'SEARCH', page: pageNum + 1 } }]);
+                log.info(`📄 Queued page ${pageNum + 1}`);
             }
-            return;
         }
-
-        // (If you later add a queued DETAIL label path, it can go here.)
     },
 
     failedRequestHandler({ request, error }) {
-        log.error(`❌ Failed: ${request.url} | ${error?.message || error}`);
+        log.error(`❌ Failed ${request.url}: ${error.message}`);
     },
 });
 
-// Kick off
 const startUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}`;
-await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1, retries: 0 } }]);
+await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1 } }]);
 
 log.info(`🎉 Done! Total jobs scraped: ${saved}`);
 await Actor.exit();
