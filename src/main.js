@@ -1,197 +1,175 @@
 /* ────────────────────────────────────────────────────────────── *
- *  Jooble job scraper – Apify Actor (ESM, Crawlee safe version)  *
- *  Compatible with Apify platform images and Crawlee 3.x+        *
+ *  Jooble Scraper – Apify Actor (ESM)
+ *  Stack: Apify SDK + Crawlee BasicCrawler + gotScraping + Cheerio
+ *  Focus: Stealth & Resilience (403/429/cookie-wall handling)
  * ────────────────────────────────────────────────────────────── */
 
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset, KeyValueStore } from 'crawlee';
+import {
+    BasicCrawler,
+    Dataset,
+    KeyValueStore,
+    RequestQueue,
+    SessionPool,
+} from 'crawlee';
+import { gotScraping } from 'got-scraping';
+import { load as cheerioLoad } from 'cheerio';
 
-// ------------------------------------------------------------------
-// 1️⃣  INPUT HANDLING
-// ------------------------------------------------------------------
+// ───────────────────────────────────────────────────────────────
+// 1) INPUT
+// ───────────────────────────────────────────────────────────────
 async function getInput() {
     const raw = await KeyValueStore.getInput();
-
     const defaults = {
         searchQuery: 'software engineer',
         location: '',
-        jobAge: 'all',
+        jobAge: 'all',             // 'all' | '1' | '7' | '30'
         maxPages: 5,
-        maxConcurrency: 10,
-        proxyConfiguration: { useApifyProxy: true },
-        userAgents: [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
-        ],
+        maxConcurrency: 3,         // tuned for stealth; raise to 5–8 once stable
+        maxItems: 100,
+        // Backoff (+ jitter) limits for block conditions (403/429/cookie-wall)
+        maxStealthRetries: 4,
+        baseBackoffMs: 1200,
+        // Proxy
+        proxyConfiguration: { useApifyProxy: true, // consider RESIDENTIAL or specific country group(s)
+            // apifyProxyGroups: ['RESIDENTIAL']
+        },
+        // Realistic Accept-* headers are built dynamically per-request
     };
-
     const input = { ...defaults, ...(raw || {}) };
     input.maxPages = +input.maxPages > 0 ? +input.maxPages : 1;
-    input.maxConcurrency = +input.maxConcurrency > 0 ? +input.maxConcurrency : 5;
+    input.maxConcurrency = +input.maxConcurrency > 0 ? +input.maxConcurrency : 3;
+    input.maxItems = +input.maxItems > 0 ? +input.maxItems : 50;
+    input.maxStealthRetries = Math.min(Math.max(+input.maxStealthRetries || 3, 1), 6);
+    input.baseBackoffMs = Math.max(+input.baseBackoffMs || 1000, 300);
     return input;
 }
 
-// ------------------------------------------------------------------
-// 2️⃣  URL BUILDER
-// ------------------------------------------------------------------
+// ───────────────────────────────────────────────────────────────
+// 2) UA + CLIENT HINTS POOL (Oct 2025 realistic)
+// ───────────────────────────────────────────────────────────────
+const UA_PROFILES = [
+    {
+        ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        chBrands: '"Not.A/Brand";v="99", "Chromium";v="128", "Google Chrome";v="128"',
+        chPlatform: '"Windows"',
+        chMobile: '?0',
+    },
+    {
+        ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+        // Safari does not send sec-ch-ua brands typically; we’ll omit brands for Safari-like requests
+        chBrands: '',
+        chPlatform: '"macOS"',
+        chMobile: '?0',
+    },
+    {
+        ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        chBrands: '"Not.A/Brand";v="99", "Chromium";v="128", "Google Chrome";v="128"',
+        chPlatform: '"Linux"',
+        chMobile: '?0',
+    },
+    {
+        ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
+        chBrands: '',
+        chPlatform: '"iOS"',
+        chMobile: '?1',
+    },
+];
+
+function randomProfile() {
+    return UA_PROFILES[Math.floor(Math.random() * UA_PROFILES.length)];
+}
+
+// Build realistic CH headers coherent with UA
+function buildHeaders({ profile, referer }) {
+    const h = {
+        'User-Agent': profile.ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Site': referer ? 'same-origin' : 'none',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-User': '?1',
+        'Sec-Fetch-Dest': 'document',
+        // No DNT, no sec-gpc – avoid bot signatures
+    };
+    if (referer) h['Referer'] = referer;
+
+    // Only send CH when Chromium-like profiles
+    if (profile.chBrands) {
+        h['sec-ch-ua'] = profile.chBrands;
+        h['sec-ch-ua-mobile'] = profile.chMobile;
+        h['sec-ch-ua-platform'] = profile.chPlatform;
+    }
+    return h;
+}
+
+// ───────────────────────────────────────────────────────────────
+// 3) URLS + HELPERS
+// ───────────────────────────────────────────────────────────────
 function buildSearchUrl({ searchQuery, location, page = 1, jobAge = 'all' }) {
     const base = 'https://jooble.org/SearchResult';
     const p = new URLSearchParams();
-    if (searchQuery) p.set('ukw', searchQuery.trim());
-    if (location) p.set('l', location.trim());
+    if (searchQuery && String(searchQuery).trim()) p.set('ukw', String(searchQuery).trim());
+    if (location && String(location).trim()) p.set('l', String(location).trim());
     if (page > 1) p.set('p', String(page));
-    if (jobAge !== 'all') p.set('date', String(jobAge));
+    if (jobAge && jobAge !== 'all') p.set('date', String(jobAge));
     const qs = p.toString();
     return qs ? `${base}?${qs}` : base;
 }
 
-// ------------------------------------------------------------------
-// 3️⃣  MAIN ACTOR
-// ------------------------------------------------------------------
-export async function main() {
-    await Actor.init();
-
-    try {
-        const input = await getInput();
-        const proxyConfiguration = await Actor.createProxyConfiguration(input.proxyConfiguration);
-        log.info(`🎬 Starting Jooble scraper | query="${input.searchQuery}"`);
-
-        const crawler = new CheerioCrawler({
-            proxyConfiguration,
-            useSessionPool: true,
-            persistCookiesPerSession: true,
-            maxConcurrency: input.maxConcurrency,
-            requestHandlerTimeoutSecs: 90,
-
-            async requestHandler(context) {
-                const { request, $, enqueueLinks, session } = context;
-                const label = request.userData?.label ?? 'SEARCH';
-                const page = request.userData?.page ?? 1;
-
-                // ------------------- Cookie wall detection -------------------
-                const bodyText = $.root().text().toLowerCase();
-                if (/are you human|verify you are human|captcha|cookie/i.test(bodyText)) {
-                    const retries = request.userData?.retries ?? 0;
-                    log.warning(`🚧 Cookie/bot wall detected on ${request.url} (retry ${retries})`);
-                    if (retries < 3) {
-                        session.retire();
-                        const newUA = input.userAgents[Math.floor(Math.random() * input.userAgents.length)];
-                        request.headers['User-Agent'] = newUA;
-                        await Actor.sleep(2000 + Math.random() * 3000);
-                        await enqueueLinks({
-                            urls: [request.url],
-                            transformRequestFunction: (req) => {
-                                req.userData = { ...request.userData, retries: retries + 1 };
-                                return req;
-                            },
-                        });
-                    } else {
-                        log.error(`❌ Giving up on ${request.url} after ${retries} retries.`);
-                    }
-                    return;
-                }
-
-                // ------------------- Normal flow -------------------
-                if (label === 'SEARCH') {
-                    await handleSearchPage(context, input);
-                } else if (label === 'DETAIL') {
-                    await handleDetailPage($, request);
-                } else {
-                    log.warning(`⚠️ Unknown label "${label}" at ${request.url}`);
-                }
-            },
-
-            failedRequestHandler({ request, error }) {
-                log.error(`❌ Request failed ${request.url}: ${error?.message || error}`);
-            },
-        });
-
-        await crawler.run([
-            {
-                url: buildSearchUrl({
-                    searchQuery: input.searchQuery,
-                    location: input.location,
-                    page: 1,
-                    jobAge: input.jobAge,
-                }),
-                userData: { label: 'SEARCH', page: 1 },
-                headers: {
-                    'User-Agent': input.userAgents[Math.floor(Math.random() * input.userAgents.length)],
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                },
-            },
-        ]);
-
-        log.info('✅ Crawling finished – check the default dataset for results.');
-    } catch (err) {
-        log.error('❌ Unexpected error in main():', err);
-        if (err?.stack) console.error(err.stack);
-    } finally {
-        await Actor.exit();
-    }
+function rand(min, max) {
+    return Math.random() * (max - min) + min;
 }
 
-// ------------------------------------------------------------------
-// 4️⃣  SEARCH PAGE HANDLER
-// ------------------------------------------------------------------
-async function handleSearchPage({ $, enqueueLinks, request }, input) {
-    const currentPage = request.userData?.page ?? 1;
-    log.info(`🔍 Page ${currentPage}: ${request.url}`);
+async function humanPauseShort() {
+    // small latency + think time
+    await Actor.sleep(rand(120, 380));
+}
 
-    const jobLinks = [];
+async function humanPauseRead() {
+    // reading time on page
+    await Actor.sleep(rand(900, 1800));
+}
+
+function isCookieOrBotWall(htmlText) {
+    const t = htmlText.toLowerCase();
+    return /are you human|verify you are human|captcha|cloudflare|cookies? (required|consent)/i.test(t);
+}
+
+function isBlockedStatus(statusCode) {
+    return statusCode === 403 || statusCode === 429;
+}
+
+function backoffDelay(baseMs, attempt) {
+    // Exponential backoff with jitter
+    const expo = baseMs * Math.pow(2, attempt);
+    const jitter = rand(0.5, 1.3);
+    return Math.min(expo * jitter, 15000); // cap 15s
+}
+
+function pickProxyUrl(proxyConfiguration, session) {
+    if (!proxyConfiguration) return undefined;
+    // Stick session id to proxy for consistency; rotate when session retires
+    return proxyConfiguration.newUrl(session?.id);
+}
+
+// ───────────────────────────────────────────────────────────────
+// 4) PARSERS
+// ───────────────────────────────────────────────────────────────
+function extractDetailLinks($, base = 'https://jooble.org') {
+    const set = new Set();
     $('a[href*="/desc/"]').each((_, el) => {
         const href = $(el).attr('href');
         if (!href || !href.includes('/desc/')) return;
-        const full = href.startsWith('http') ? href : `https://jooble.org${href}`;
-        jobLinks.push(full);
+        const abs = href.startsWith('http') ? href : new URL(href, base).href;
+        set.add(abs);
     });
-
-    log.info(`   Found ${jobLinks.length} job links`);
-
-    if (jobLinks.length) {
-        await enqueueLinks({
-            urls: jobLinks,
-            transformRequestFunction: (req) => {
-                req.userData = { label: 'DETAIL', searchPage: currentPage };
-                req.headers = {
-                    'User-Agent': input.userAgents[Math.floor(Math.random() * input.userAgents.length)],
-                };
-                return req;
-            },
-        });
-    }
-
-    if (currentPage < input.maxPages && jobLinks.length > 0) {
-        const nextPage = currentPage + 1;
-        const nextUrl = buildSearchUrl({
-            searchQuery: input.searchQuery,
-            location: input.location,
-            page: nextPage,
-            jobAge: input.jobAge,
-        });
-        log.info(`   ➡️ Enqueuing next page ${nextPage}`);
-        await enqueueLinks({
-            urls: [nextUrl],
-            transformRequestFunction: (req) => {
-                req.userData = { label: 'SEARCH', page: nextPage };
-                req.headers = {
-                    'User-Agent': input.userAgents[Math.floor(Math.random() * input.userAgents.length)],
-                };
-                return req;
-            },
-        });
-    }
+    return [...set];
 }
 
-// ------------------------------------------------------------------
-// 5️⃣  DETAIL PAGE HANDLER
-// ------------------------------------------------------------------
-async function handleDetailPage($, request) {
-    log.info(`📄 Job detail: ${request.url}`);
-
+function extractJobDetail($, url) {
     const getFirst = (sels) => {
         for (const s of sels) {
             const txt = $(s).first().text().trim();
@@ -199,7 +177,6 @@ async function handleDetailPage($, request) {
         }
         return '';
     };
-
     const title = getFirst(['h1', '.job-title', '.title']);
     const company = getFirst(['.company', '.employer', '.company-name']);
     const location = getFirst(['.location', '.job-location']);
@@ -208,33 +185,188 @@ async function handleDetailPage($, request) {
     const description_html = descNode.html() || '';
     const description_text = descNode.text().replace(/\s+/g, ' ').trim() || '';
 
-    const job = {
+    return {
         title,
         company,
         location,
         salary,
         description_html,
         description_text,
-        job_url: request.url,
+        job_url: url,
         scrapedAt: new Date().toISOString(),
         source: 'Jooble',
     };
-
-    if (job.title) {
-        await Dataset.pushData(job);
-        log.info(`   ✅ Saved: "${job.title}"`);
-    } else {
-        log.warning(`   ⚠️ Missing title at ${request.url}`);
-    }
 }
 
-// ------------------------------------------------------------------
-// 6️⃣  LOCAL RUN SUPPORT
-// ------------------------------------------------------------------
-if (import.meta.url === `file://${process.argv[1]}`) {
-    main().catch((e) => {
-        log.error('❌ Fatal error:', e);
-        console.error(e.stack);
-        process.exit(1);
-    });
+// ───────────────────────────────────────────────────────────────
+// 5) MAIN
+// ───────────────────────────────────────────────────────────────
+export async function main() {
+    await Actor.init();
+    let saved = 0;
+
+    try {
+        const input = await getInput();
+        const rq = await RequestQueue.open();
+        const proxyConfiguration = await Actor.createProxyConfiguration(input.proxyConfiguration);
+        const sessionPool = await SessionPool.open({ maxPoolSize: 100 });
+
+        // seed
+        await rq.addRequest({
+            url: buildSearchUrl({ searchQuery: input.searchQuery, location: input.location, page: 1, jobAge: input.jobAge }),
+            userData: { label: 'SEARCH', page: 1, retries: 0, referer: 'https://jooble.org/' },
+        });
+
+        const crawler = new BasicCrawler({
+            requestQueue: rq,
+            useSessionPool: true,
+            maxConcurrency: input.maxConcurrency,
+            // BasicCrawler lets us fully control networking via gotScraping.
+            async requestHandler({ request, session }) {
+                if (saved >= input.maxItems) return;
+
+                const label = request.userData?.label ?? 'SEARCH';
+                const attempt = request.userData?.retries ?? 0;
+                const referer = request.userData?.referer;
+                const profile = randomProfile();
+                const headers = buildHeaders({ profile, referer });
+
+                const proxyUrl = pickProxyUrl(proxyConfiguration, session);
+
+                await humanPauseShort(); // latency jitter pre-flight
+                let response;
+                try {
+                    response = await gotScraping({
+                        url: request.url,
+                        method: 'GET',
+                        headers,
+                        proxyUrl,
+                        timeout: { request: 20000 },
+                        retry: { limit: 0 }, // our own retry strategy
+                        http2: true,
+                        decompress: true,
+                        throwHttpErrors: false, // we inspect status ourselves
+                    });
+                } catch (e) {
+                    // Network or TLS failure – re-enqueue with backoff
+                    const delay = backoffDelay(input.baseBackoffMs, attempt);
+                    log.warning(`🌐 Network error on ${request.url} (${e.message}); retry in ${Math.round(delay)}ms`);
+                    session?.markBad();
+                    session?.retire();
+                    await Actor.sleep(delay);
+                    await rq.addRequest({
+                        url: request.url,
+                        userData: { ...request.userData, retries: attempt + 1, // keep label/page
+                            // New referer chain still okay
+                        },
+                        forefront: false,
+                    });
+                    return;
+                }
+
+                const { statusCode, body } = response;
+                const bodyStr = typeof body === 'string' ? body : body?.toString?.('utf8') || String(body || '');
+
+                // Block signals
+                if (isBlockedStatus(statusCode) || isCookieOrBotWall(bodyStr)) {
+                    if (attempt < input.maxStealthRetries) {
+                        const delay = backoffDelay(input.baseBackoffMs, attempt);
+                        log.warning(`🧱 Blocked (${statusCode}) or wall on ${request.url} – retry ${attempt + 1} in ${Math.round(delay)}ms`);
+                        // rotate session + UA
+                        session?.markBad();
+                        session?.retire();
+                        await Actor.sleep(delay);
+                        await rq.addRequest({
+                            url: request.url,
+                            userData: {
+                                ...request.userData,
+                                retries: attempt + 1,
+                                // keep referer chain
+                            },
+                            forefront: false,
+                        });
+                        return;
+                    } else {
+                        log.error(`❌ Giving up after ${attempt} retries: ${request.url}`);
+                        return;
+                    }
+                }
+
+                // Parse HTML
+                const $ = cheerioLoad(bodyStr);
+
+                if (label === 'SEARCH') {
+                    const pageNo = request.userData?.page ?? 1;
+
+                    // Realistic “reading time”
+                    await humanPauseRead();
+
+                    const links = extractDetailLinks($, request.url);
+                    log.info(`🔎 Search p${pageNo}: found ${links.length} detail links`);
+
+                    if (links.length) {
+                        // enqueue details with natural referer chain + UA rotation on fetch
+                        for (const detailUrl of links) {
+                            await rq.addRequest({
+                                url: detailUrl,
+                                userData: {
+                                    label: 'DETAIL',
+                                    searchPage: pageNo,
+                                    retries: 0,
+                                    referer: request.url, // build a real referer chain
+                                },
+                            });
+                        }
+                    }
+
+                    // Pagination (stop if limit reached)
+                    if (pageNo < input.maxPages && saved < input.maxItems) {
+                        const nextUrl = buildSearchUrl({
+                            searchQuery: input.searchQuery,
+                            location: input.location,
+                            page: pageNo + 1,
+                            jobAge: input.jobAge,
+                        });
+                        await rq.addRequest({
+                            url: nextUrl,
+                            userData: { label: 'SEARCH', page: pageNo + 1, retries: 0, referer: request.url },
+                            forefront: false, // let details mix in for pacing
+                        });
+                        // human think time between pages
+                        await humanPauseShort();
+                    }
+
+                    return;
+                }
+
+                if (label === 'DETAIL') {
+                    // Realistic “reading time”
+                    await humanPauseRead();
+
+                    const item = extractJobDetail($, request.url);
+                    if (item.title) {
+                        await Dataset.pushData(item);
+                        saved++;
+                        log.info(`✅ Saved #${saved}: ${item.title}`);
+                    } else {
+                        log.warning(`⚠️ No title on detail: ${request.url}`);
+                    }
+                    return;
+                }
+            },
+
+            failedRequestHandler: async ({ request, error }) => {
+                log.error(`❌ Failed permanently ${request.url} – ${error?.message || error}`);
+            },
+        });
+
+        await crawler.run();
+
+        log.info(`🎉 Done. Saved ${saved} item(s).`);
+    } catch (err) {
+        log.error('❌ Unexpected error in main():', err);
+        if (err?.stack) console.error(err.stack);
+    } finally {
+        await Actor.exit();
+    }
 }
