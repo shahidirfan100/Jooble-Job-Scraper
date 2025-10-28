@@ -1,0 +1,64 @@
+{
+  "title": "Jooble Job Scraper",
+  "description": "Scrape job listings from Jooble.org. Provide either start URLs or a search query. Actor paginates and optionally scrapes detail pages.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrls": {
+      "title": "Start URLs",
+      "type": "array",
+      "description": "Start scraping from specific Jooble search result URLs. If provided, these will override searchQuery.",
+      "items": { "type": "string", "format": "uri" },
+      "editor": "text"
+    },
+    "searchQuery": {
+      "title": "Search query (if not using Start URLs)",
+      "type": "string",
+      "description": "Keyword for job search, e.g., 'admin'. Will be used as the 'ukw' parameter in Jooble search URLs.",
+      "editor": "textfield",
+      "prefill": "admin"
+    },
+    "location": {
+      "title": "Location (if not using Start URLs)",
+      "type": "string",
+      "description": "Location filter for Jooble search results (leave empty for broader results).",
+      "editor": "textfield"
+    },
+    "collectDetails": {
+      "title": "Collect job details",
+      "type": "boolean",
+      "description": "If enabled, scraper visits job detail pages to extract full description and JSON-LD.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "maxItems": {
+      "title": "Maximum number of jobs",
+      "type": "integer",
+      "description": "The maximum number of jobs to collect. Default is 100.",
+      "minimum": 1,
+      "default": 100,
+      "editor": "number"
+    },
+     "cookies": {
+      "title": "Custom cookies (raw header)",
+      "type": "string",
+      "description": "Optional raw 'Cookie' header string. Can help bypass consent banners.",
+      "editor": "textfield"
+    },
+    "cookiesJson": {
+      "title": "Custom cookies (JSON)",
+      "type": "string",
+      "description": "Optional JSON-formatted cookies. Accepts an array (e.g., [{\"name\":\"a\",\"value\":\"1\"}]) or an object map (e.g., {\"a\":\"1\"}).",
+      "editor": "textarea"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Proxy settings (use Apify Proxy for best results).",
+      "editor": "proxy",
+      "default": { "useApifyProxy": true }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}
