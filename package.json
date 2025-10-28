@@ -1,5 +1,5 @@
 {
-  "name": "jooble-playwright-scraper",
+  "name": "jooble-job-scraper",
   "version": "1.0.0",
   "type": "module",
   "description": "Fast lightweight Jooble scraper using Apify SDK, Crawlee, and PlaywrightCrawler",
