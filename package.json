@@ -1,13 +1,15 @@
 {
-  "name": "jooble-job-scraper",
+  "name": "jooble-jobs-actor",
   "version": "1.0.0",
+  "description": "Lightweight Jooble.org jobs scraper using Cheerio (Crawlee + gotScraping).",
   "type": "module",
-  "description": "Fast Jooble scraper using Apify SDK and Crawlee with HTTP-based scraping",
   "scripts": {
-    "start": "node ./src/main.js"
+    "start": "node src/main.js"
   },
   "dependencies": {
-    "apify": "^3.3.0",
-    "crawlee": "^3.7.0"
+    "apify": "^3.4.5",
+    "crawlee": "^3.14.1",
+    "cheerio": "^1.0.0-rc.12",
+    "got-scraping": "^4.0.3"
   }
 }

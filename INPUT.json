@@ -1,6 +1,7 @@
 {
   "searchQuery": "admin",
   "maxItems": 10,
-  "maxPages": 3,
-  "maxConcurrency": 5
+  "proxyConfiguration": {
+    "useApifyProxy": true
+  }
 }

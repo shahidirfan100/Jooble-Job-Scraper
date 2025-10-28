@@ -1,235 +1,217 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
+import { gotScraping } from 'got-scraping';
+import { load as cheerioLoad } from 'cheerio';
 
+// ───────────────────────────────────────────────────────────────
+// Helpers & Config
+// ───────────────────────────────────────────────────────────────
 const BASE_URL = 'https://jooble.org';
+const MAX_RETRIES = 3;
 
-// Enhanced user agents that look more legitimate
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+const UA_PROFILES = [
+    {
+        ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        ch: {
+            'sec-ch-ua': '"Not.A/Brand";v="99", "Chromium";v="128", "Google Chrome";v="128"',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-ch-ua-mobile': '?0',
+        },
+    },
+    {
+        ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+        ch: {
+            'sec-ch-ua-platform': '"macOS"',
+            'sec-ch-ua-mobile': '?0',
+        },
+    },
 ];
 
-const getRandomUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+function randomProfile() {
+    return UA_PROFILES[Math.floor(Math.random() * UA_PROFILES.length)];
+}
 
-// Extract job links from HTML using Cheerio
-function extractJobLinks(baseUrl, $) {
-    const links = new Set();
-    $('a[href*="/desc/"], a[data-qa="vacancy-serp__vacancy-title"], a[class*="job-link"]').each((_, el) => {
+function isCookieOrBotWall(html) {
+    const t = html.toLowerCase();
+    return /are you human|verify you are human|captcha|cloudflare|before you continue to jooble|accept our cookies|consent/i.test(t);
+}
+
+function extractDetailLinks($, base = BASE_URL) {
+    const set = new Set();
+    $('a[href*="desc"], a[data-qa="vacancy-serp__vacancy-title"], a[class*="job-link"], a[class*="link position-link"]').each((_, el) => {
         const href = $(el).attr('href');
-        if (href) {
-            const abs = href.startsWith('http') ? href : new URL(href, baseUrl).href;
-            if (abs.includes('/desc/')) links.add(abs);
-        }
+        if (!href || !href.includes('desc')) return;
+        const abs = href.startsWith('http') ? href : new URL(href, base).href;
+        set.add(abs);
     });
-    return [...links];
+    return [...set];
 }
 
-// Extract job data from Cheerio object
-function extractJobData($, url) {
-    const job = {
-        title: '',
-        company: '',
-        location: '',
-        salary: '',
-        description: '',
-        job_url: url,
-        scrapedAt: new Date().toISOString(),
+function rand(min, max) { return Math.random() * (max - min) + min; }
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ───────────────────────────────────────────────────────────────
+// Auto-fetch Jooble consent cookies
+// ───────────────────────────────────────────────────────────────
+async function getConsentCookies(proxyUrl) {
+    log.info('🌐 Fetching Jooble consent cookies...');
+    const profile = randomProfile();
+    const headers = {
+        'User-Agent': profile.ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Upgrade-Insecure-Requests': '1',
+        ...profile.ch,
     };
+    const res = await gotScraping({
+        url: BASE_URL,
+        proxyUrl,
+        headers,
+        timeout: { request: 15000 },
+        throwHttpErrors: false,
+    });
 
-    // Try multiple selectors for each field
-    const selectors = {
-        title: ['h1', '.job-title', '.vacancy-title', '[data-qa="vacancy-title"]'],
-        company: ['.company', '.employer', '.company-name', '[data-qa="vacancy-company-name"]'],
-        location: ['.location', '.job-location', '[data-qa="vacancy-view-location"]'],
-        salary: ['.salary', '.compensation', '[data-qa="vacancy-salary"]'],
-        description: ['.job-description', '.vacancy-description', '.description', '[data-qa="vacancy-description"]', 'main', 'article'],
-    };
-
-    for (const selector of selectors.title) {
-        if (!job.title) {
-            job.title = $(selector).first().text().trim();
-        }
-    }
-
-    for (const selector of selectors.company) {
-        if (!job.company) {
-            job.company = $(selector).first().text().trim();
-        }
-    }
-
-    for (const selector of selectors.location) {
-        if (!job.location) {
-            job.location = $(selector).first().text().trim();
-        }
-    }
-
-    for (const selector of selectors.salary) {
-        if (!job.salary) {
-            job.salary = $(selector).first().text().trim();
-        }
-    }
-
-    for (const selector of selectors.description) {
-        if (!job.description) {
-            job.description = $(selector).first().text().trim().substring(0, 5000);
-        }
-    }
-
-    return job;
+    const setCookies = res.headers['set-cookie'] || [];
+    const cookieHeader = Array.isArray(setCookies)
+        ? setCookies.map(c => c.split(';')[0]).join('; ')
+        : '';
+    log.info(cookieHeader ? '✅ Consent cookies obtained' : '⚠️ No cookies returned');
+    return cookieHeader;
 }
 
-// ---------- Main Execution ----------
+// ───────────────────────────────────────────────────────────────
+// Main
+// ───────────────────────────────────────────────────────────────
+export async function main() {
+    await Actor.init();
 
-await Actor.init();
+    let saved = 0;
+    let consentCookies = '';
 
-const input = (await Actor.getInput()) || {};
-const {
-    searchQuery = 'developer',
-    maxPages = 3,
-    maxItems = 20,
-} = input;
-
-log.info(`🎬 Jooble scraper started | query="${searchQuery}" maxPages=${maxPages} maxItems=${maxItems}`);
-
-// Create proxy configuration with residential proxies for better success
-let proxyConfiguration;
-try {
-    proxyConfiguration = await Actor.createProxyConfiguration({
-        useApifyProxy: true,
-        apifyProxyGroups: ['RESIDENTIAL'],
-        countryCode: 'US',
-    });
-    log.info('✅ Residential proxy configured');
-} catch (e) {
-    log.warning('⚠️ Residential proxy not available, trying datacenter');
     try {
-        proxyConfiguration = await Actor.createProxyConfiguration({
+        const input = (await Actor.getInput()) || {};
+        const {
+            searchQuery = 'developer',
+            maxPages = 3,
+            maxConcurrency = 3,
+            maxItems = 50,
+        } = input;
+
+        const proxyConfiguration = await Actor.createProxyConfiguration({
             useApifyProxy: true,
+            apifyProxyGroups: ['RESIDENTIAL'],
         });
-        log.info('✅ Datacenter proxy configured');
-    } catch (e2) {
-        log.warning('⚠️ No proxy available, continuing without');
-        proxyConfiguration = undefined;
+        const proxyUrl = await proxyConfiguration.newUrl();
+        consentCookies = await getConsentCookies(proxyUrl);
+
+        const crawler = new CheerioCrawler({
+            proxyConfiguration,
+            useSessionPool: true,
+            persistCookiesPerSession: true,
+            maxConcurrency,
+            requestHandlerTimeoutSecs: 60,
+
+            async requestFunction({ request, session }) {
+                const profile = randomProfile();
+                const headers = {
+                    'User-Agent': profile.ua,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Upgrade-Insecure-Requests': '1',
+                    Cookie: consentCookies, // ✅ attach consent cookies
+                    ...profile.ch,
+                };
+                const proxyUrl = await proxyConfiguration.newUrl(session?.id);
+
+                const response = await gotScraping({
+                    url: request.url,
+                    proxyUrl,
+                    headers,
+                    http2: true,
+                    throwHttpErrors: false,
+                    timeout: { request: 20000 },
+                });
+
+                return { body: response.body, statusCode: response.statusCode };
+            },
+
+            async requestHandler({ request, body, enqueueLinks, session }) {
+                const label = request.userData?.label || 'SEARCH';
+                const page = request.userData?.page || 1;
+                const $ = cheerioLoad(body);
+                const status = request.statusCode;
+
+                if (!body || isCookieOrBotWall(body)) {
+                    log.warning(`🚧 Cookie wall on ${request.url}`);
+                    session.retire();
+
+                    // Refresh consent cookie and retry
+                    consentCookies = await getConsentCookies(await proxyConfiguration.newUrl(session.id));
+                    if ((request.userData.retries || 0) < MAX_RETRIES) {
+                        await enqueueLinks({
+                            urls: [request.url],
+                            transformRequestFunction: (req) => {
+                                req.userData = { ...request.userData, retries: (request.userData.retries || 0) + 1 };
+                                return req;
+                            },
+                        });
+                    } else {
+                        await Dataset.pushData({ error: 'Blocked', url: request.url });
+                    }
+                    return;
+                }
+
+                if (label === 'SEARCH') {
+                    const links = extractDetailLinks($, request.url);
+                    log.info(`🔎 Page ${page}: ${links.length} jobs`);
+                    for (const link of links.slice(0, maxItems - saved)) {
+                        await enqueueLinks({
+                            urls: [link],
+                            transformRequestFunction: (req) => {
+                                req.userData = { label: 'DETAIL', referer: request.url };
+                                return req;
+                            },
+                        });
+                    }
+
+                    if (page < maxPages && saved < maxItems) {
+                        const next = new URL(request.url);
+                        next.searchParams.set('p', page + 1);
+                        await enqueueLinks({
+                            urls: [next.href],
+                            transformRequestFunction: (req) => {
+                                req.userData = { label: 'SEARCH', page: page + 1 };
+                                return req;
+                            },
+                        });
+                    }
+                    return;
+                }
+
+                if (label === 'DETAIL') {
+                    const title = $('h1, .job-title, .title').first().text().trim();
+                    const company = $('.company, .employer, .company-name').first().text().trim();
+                    const location = $('.location, .job-location').first().text().trim();
+                    const salary = $('.salary, .compensation').first().text().trim();
+                    const desc = $('.job-description, .description, .vacancy-description, .content, main').first().text().replace(/\s+/g, ' ').trim();
+
+                    if (title) {
+                        await Dataset.pushData({ title, company, location, salary, description: desc, job_url: request.url });
+                        saved++;
+                        log.info(`✅ Saved #${saved}: ${title}`);
+                    } else {
+                        log.warning(`⚠️ Empty detail page: ${request.url}`);
+                    }
+                }
+            },
+        });
+
+        const startUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}`;
+        await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1 } }]);
+        log.info(`🎉 Finished — ${saved} job(s) saved.`);
+    } catch (err) {
+        log.error('❌ Error in main():', err);
+    } finally {
+        await Actor.exit();
     }
 }
-
-let saved = 0;
-
-const crawler = new CheerioCrawler({
-    proxyConfiguration,
-    maxConcurrency: 1, // Very low concurrency to avoid detection
-    maxRequestRetries: 5, // More retries
-    requestHandlerTimeoutSecs: 60,
-    useSessionPool: true,
-    sessionPoolOptions: {
-        maxPoolSize: 20,
-        sessionOptions: {
-            maxUsageCount: 2, // Rotate sessions more frequently
-            maxErrorScore: 5,
-        },
-    },
-
-    // Enhanced request options for stealth
-    requestOptions: {
-        headers: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'max-age=0',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'DNT': '1',
-        },
-    },
-
-    async requestHandler({ $, request, crawler }) {
-        const label = request.userData?.label || 'SEARCH';
-        const pageNum = request.userData?.page || 1;
-
-        // Check for blocks
-        const bodyText = $('body').text();
-        const title = $('title').text() || '';
-
-        if (/captcha|verify|blocked|access denied|403|robot|bot/i.test(bodyText) ||
-            /captcha|verify|blocked|403/i.test(title)) {
-            log.warning(`🚧 Detected block on ${request.url} - Title: ${title.substring(0, 50)}`);
-            throw new Error('Page blocked or captcha detected');
-        }
-
-        if (label === 'SEARCH') {
-            const jobLinks = extractJobLinks(request.url, $);
-            log.info(`🔎 Page ${pageNum}: found ${jobLinks.length} job links`);
-
-            if (jobLinks.length === 0) {
-                log.warning(`No job links found on page ${pageNum}. HTML length: ${$.html().length}`);
-                return;
-            }
-
-            // Queue job detail pages
-            const remaining = maxItems - saved;
-            const linksToProcess = jobLinks.slice(0, Math.max(0, remaining));
-
-            for (const jobUrl of linksToProcess) {
-                await crawler.addRequests([{
-                    url: jobUrl,
-                    userData: { label: 'DETAIL' },
-                    headers: {
-                        'User-Agent': getRandomUA(),
-                        'Referer': request.url,
-                    },
-                }]);
-            }
-
-            log.info(`📋 Queued ${linksToProcess.length} job detail pages`);
-
-            // Queue next search page
-            if (pageNum < maxPages && saved < maxItems && jobLinks.length > 0) {
-                const nextPageNum = pageNum + 1;
-                const nextUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}&p=${nextPageNum}`;
-
-                await crawler.addRequests([{
-                    url: nextUrl,
-                    userData: { label: 'SEARCH', page: nextPageNum },
-                    headers: {
-                        'User-Agent': getRandomUA(),
-                        'Referer': request.url,
-                    },
-                }]);
-
-                log.info(`📄 Queued page ${nextPageNum}`);
-            }
-        } else if (label === 'DETAIL') {
-            const jobData = extractJobData($, request.url);
-
-            if (jobData.title) {
-                await Dataset.pushData(jobData);
-                saved++;
-                log.info(`✅ [${saved}/${maxItems}] ${jobData.title.substring(0, 50)}`);
-
-                // Stop if reached max items
-                if (saved >= maxItems) {
-                    log.info(`🎯 Reached maxItems (${maxItems}), stopping crawler`);
-                    await crawler.autoscaledPool?.abort();
-                }
-            } else {
-                log.warning(`⚠️ No title found on ${request.url}`);
-            }
-        }
-    },
-
-    failedRequestHandler({ request, error }) {
-        log.error(`❌ Failed ${request.url}: ${error.message}`);
-    },
-});
-
-const startUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}`;
-await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1 } }]);
-
-log.info(`🎉 Done! Total jobs scraped: ${saved}`);
-await Actor.exit();
