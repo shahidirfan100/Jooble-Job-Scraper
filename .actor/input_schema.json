@@ -23,6 +23,15 @@
       "description": "Location filter for Jooble search results (leave empty for broader results).",
       "editor": "textfield"
     },
+    "jobAge": {
+      "title": "Job Age Filter",
+      "type": "string",
+      "description": "Filter jobs by posting date.",
+      "editor": "select",
+      "enum": ["all", "1", "7", "30"],
+      "enumTitles": ["All time", "Last 24 hours", "Last 7 days", "Last 30 days"],
+      "default": "all"
+    },
     "collectDetails": {
       "title": "Collect job details",
       "type": "boolean",
