@@ -1,13 +1,13 @@
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, Dataset, sleep } from 'crawlee';
 import { load as loadCheerio } from 'cheerio';
-import { gotScraping } from 'got-scraping'; // ✅ correct named import
+import { gotScraping } from 'got-scraping';
 
 const BASE_URL = 'https://jooble.org';
-const DETAIL_BATCH = 5; // concurrent detail tabs
-const MAX_RETRIES = 2; // per search page
+const DETAIL_BATCH = 5;
+const MAX_RETRIES = 2;
 
-// -------------------- Helpers ----------------------
+// ---------- Helper Functions ----------
 
 function randomUA() {
     const UAS = [
@@ -63,7 +63,7 @@ function chunk(arr, n) {
     return out;
 }
 
-// Fetch consent cookie (if EU / blocked)
+// Auto-fetch consent cookie (EU regions)
 async function getConsentCookie() {
     try {
         const res = await gotScraping({
@@ -83,7 +83,7 @@ async function getConsentCookie() {
     }
 }
 
-// -------------------- Main ----------------------
+// ---------- Main Execution ----------
 
 await Actor.init();
 
@@ -135,6 +135,7 @@ const crawler = new PlaywrightCrawler({
                 if (['image', 'stylesheet', 'font', 'media'].includes(t)) route.abort();
                 else route.continue();
             });
+
             // stealth
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -142,7 +143,15 @@ const crawler = new PlaywrightCrawler({
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             });
-            await page.setUserAgent(randomUA());
+
+            // ✅ Correct way to set UA in Playwright (via context)
+            const ua = randomUA();
+            await page.context().setExtraHTTPHeaders({
+                'User-Agent': ua,
+                'Accept-Language': 'en-US,en;q=0.9',
+            });
+
+            // consent cookie
             if (consentCookie) {
                 const [name, value] = consentCookie.split('=');
                 await page.context().addCookies([{ name, value, domain: 'jooble.org' }]);
@@ -218,6 +227,7 @@ const crawler = new PlaywrightCrawler({
     },
 });
 
+// Start crawling
 const startUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}`;
 await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1 } }]);
 
