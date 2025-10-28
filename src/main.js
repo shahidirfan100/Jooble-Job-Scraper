@@ -1,27 +1,80 @@
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
-import { load as loadCheerio } from 'cheerio';
+import { CheerioCrawler, Dataset } from 'crawlee';
 
 const BASE_URL = 'https://jooble.org';
-const MAX_RETRIES = 3;
-
-const UAS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-];
-const randomUA = () => UAS[Math.floor(Math.random() * UAS.length)];
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function extractJobLinks(pageUrl, $) {
     const set = new Set();
-    $('a[href*="/desc/"], a[data-qa="vacancy-serp__vacancy-title"], a[class*="job-link"], a[class*="link position-link"]').each((_, el) => {
+    // Multiple selectors for job links on Jooble
+    $('a[href*="/desc/"], a[data-qa="vacancy-serp__vacancy-title"], a[class*="job-link"], a.position-link, article a').each((_, el) => {
         const href = $(el).attr('href');
         if (!href) return;
+        // Skip non-job links
+        if (href.includes('/SearchResult') || href.includes('?ukw=')) return;
         const abs = href.startsWith('http') ? href : new URL(href, pageUrl).href;
-        set.add(abs);
+        if (abs.includes('/desc/')) {
+            set.add(abs);
+        }
     });
     return [...set];
+}
+
+function extractJobData($, url) {
+    const data = {
+        title: '',
+        company: '',
+        location: '',
+        salary: '',
+        date_posted: '',
+        job_type: '',
+        description: '',
+        job_url: url,
+        scrapedAt: new Date().toISOString()
+    };
+
+    // Try JSON-LD first
+    $('script[type="application/ld+json"]').each((_, el) => {
+        try {
+            const json = JSON.parse($(el).html() || '{}');
+            if (json['@type'] === 'JobPosting') {
+                data.title = json.title || data.title;
+                data.company = json.hiringOrganization?.name || data.company;
+                data.location = json.jobLocation?.address?.addressLocality || 
+                               json.jobLocation?.address?.addressRegion || data.location;
+                data.salary = json.baseSalary?.value?.value || json.baseSalary?.minValue || data.salary;
+                data.date_posted = json.datePosted || data.date_posted;
+                data.job_type = json.employmentType || data.job_type;
+                data.description = json.description || data.description;
+            }
+        } catch (e) {
+            // Skip invalid JSON
+        }
+    });
+
+    // Fallback to HTML selectors
+    if (!data.title) {
+        data.title = $('h1').first().text().trim() ||
+                    $('.job-title, .vacancy-title, [data-qa="vacancy-title"]').first().text().trim();
+    }
+    
+    if (!data.company) {
+        data.company = $('.company, .employer, .company-name, [data-qa="vacancy-company-name"]').first().text().trim();
+    }
+    
+    if (!data.location) {
+        data.location = $('.location, .job-location, [data-qa="vacancy-view-location"]').first().text().trim();
+    }
+    
+    if (!data.salary) {
+        data.salary = $('.salary, .compensation, [data-qa="vacancy-salary"]').first().text().trim();
+    }
+    
+    if (!data.description) {
+        data.description = $('.job-description, .description, .vacancy-description, [data-qa="vacancy-description"]').first().text().trim() ||
+                          $('main, article, .content').first().text().trim().substring(0, 5000);
+    }
+
+    return data;
 }
 
 async function run() {
@@ -34,138 +87,109 @@ async function run() {
             searchQuery = 'developer',
             maxPages = 3,
             maxItems = 50,
-            maxConcurrency = 3
+            maxConcurrency = 5,
+            proxyConfiguration: inputProxyConfig
         } = input;
 
-        log.info(`🎬 Jooble Playwright run started | query="${searchQuery}" pages=${maxPages} items=${maxItems} conc=${maxConcurrency}`);
+        log.info(`🎬 Jooble scraper started | query="${searchQuery}" maxPages=${maxPages} maxItems=${maxItems}`);
 
-        const proxyConfiguration = await Actor.createProxyConfiguration({
-            useApifyProxy: true,
-            apifyProxyGroups: ['RESIDENTIAL']
-        });
+        // Create proxy configuration - handle both local and Apify platform
+        let proxyConfiguration;
+        try {
+            if (inputProxyConfig?.useApifyProxy) {
+                proxyConfiguration = await Actor.createProxyConfiguration(inputProxyConfig);
+                log.info('✅ Using Apify proxy');
+            } else {
+                proxyConfiguration = await Actor.createProxyConfiguration();
+                log.info('✅ Proxy configuration created');
+            }
+        } catch (e) {
+            log.warning('⚠️ No proxy available, continuing without proxy');
+            proxyConfiguration = undefined;
+        }
 
         const startUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}`;
-
-        const crawler = new PlaywrightCrawler({
+        
+        const crawler = new CheerioCrawler({
             proxyConfiguration,
             maxConcurrency,
-            headless: true,
-            navigationTimeoutSecs: 45,
-            useSessionPool: true,
-            persistCookiesPerSession: true,
-
-            async preNavigationHooks({ page, request }) {
-                const ua = randomUA();
-                await page.setExtraHTTPHeaders({
-                    'User-Agent': ua,
-                    'Accept-Language': 'en-US,en;q=0.9'
-                });
-                await page.setUserAgent(ua);
-                // Basic stealth tweak
-                await page.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                });
-                log.debug(`➡️ Navigating: ${request.url}`);
-            },
-
-            async requestHandler({ page, request, enqueueLinks }) {
+            maxRequestRetries: 3,
+            requestHandlerTimeoutSecs: 60,
+            
+            // Enhanced request headers for stealth
+            async requestHandler({ $, request, enqueueLinks, crawler }) {
                 const label = request.userData?.label || 'SEARCH';
                 const pageNum = request.userData?.page || 1;
 
-                await page.waitForLoadState('domcontentloaded', { timeout: 20000 });
-                await sleep(400 + Math.random() * 600);
-
-                const html = await page.content();
-
-                // Consent / bot wall quick check
-                if (/before you continue|are you human|verify|captcha/i.test(html)) {
-                    log.warning(`🚧 Consent/bot wall on ${request.url}`);
-                    if ((request.userData.retries || 0) < MAX_RETRIES) {
-                        await enqueueLinks({
-                            urls: [request.url],
-                            transformRequestFunction: (r) => {
-                                r.userData = { ...request.userData, retries: (request.userData.retries || 0) + 1 };
-                                return r;
-                            },
-                        });
-                    } else {
-                        await Dataset.pushData({ error: 'Consent wall', url: request.url });
-                    }
+                // Check for errors or blocks
+                const bodyText = $('body').text();
+                if (/blocked|captcha|verify you are human/i.test(bodyText)) {
+                    log.warning(`🚧 Possible block detected on ${request.url}`);
                     return;
                 }
 
-                // SEARCH page
                 if (label === 'SEARCH') {
-                    const $ = loadCheerio(html);
                     const links = extractJobLinks(request.url, $);
-                    log.info(`🔎 Search page ${pageNum}: found ${links.length} job links`);
+                    log.info(`🔎 Page ${pageNum}: found ${links.length} job links`);
 
-                    for (const jobUrl of links.slice(0, Math.max(0, maxItems - saved))) {
-                        await enqueueLinks({
-                            urls: [jobUrl],
-                            transformRequestFunction: (r) => {
-                                r.userData = { label: 'DETAIL', referer: request.url };
-                                return r;
-                            },
-                        });
+                    // Enqueue job detail pages
+                    const remaining = maxItems - saved;
+                    for (const jobUrl of links.slice(0, Math.max(0, remaining))) {
+                        await crawler.addRequests([{
+                            url: jobUrl,
+                            userData: { label: 'DETAIL' }
+                        }]);
                     }
 
-                    // pagination
+                    // Pagination
                     if (pageNum < maxPages && saved < maxItems) {
-                        const next = new URL(request.url);
-                        next.searchParams.set('p', String(pageNum + 1));
-                        await enqueueLinks({
-                            urls: [next.href],
-                            transformRequestFunction: (r) => {
-                                r.userData = { label: 'SEARCH', page: pageNum + 1 };
-                                return r;
-                            },
-                        });
+                        const nextPageNum = pageNum + 1;
+                        const nextUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}&p=${nextPageNum}`;
+                        await crawler.addRequests([{
+                            url: nextUrl,
+                            userData: { label: 'SEARCH', page: nextPageNum }
+                        }]);
+                        log.info(`📄 Queued page ${nextPageNum}`);
                     }
                     return;
                 }
 
-                // DETAIL page
                 if (label === 'DETAIL') {
-                    const title = (await page.textContent('h1, .job-title, .title'))?.trim() || '';
-                    const company = (await page.textContent('.company, .employer, .company-name'))?.trim() || '';
-                    const location = (await page.textContent('.location, .job-location'))?.trim() || '';
-                    const salary = (await page.textContent('.salary, .compensation'))?.trim() || '';
-                    const description = (await page.textContent('.job-description, .description, .vacancy-description, .content, main'))?.trim() || '';
-
-                    if (title) {
-                        await Dataset.pushData({
-                            title, company, location, salary, description,
-                            job_url: request.url,
-                            scrapedAt: new Date().toISOString(),
-                        });
+                    const jobData = extractJobData($, request.url);
+                    
+                    if (jobData.title) {
+                        await Dataset.pushData(jobData);
                         saved++;
-                        log.info(`✅ Saved #${saved}: ${title}`);
+                        log.info(`✅ Saved #${saved}: ${jobData.title.substring(0, 60)}`);
                     } else {
-                        log.warning(`⚠️ No title on ${request.url}`);
+                        log.warning(`⚠️ No title found on ${request.url}`);
+                    }
+
+                    // Stop if reached max items
+                    if (saved >= maxItems) {
+                        log.info(`🎯 Reached maxItems (${maxItems}), stopping crawler`);
+                        await crawler.autoscaledPool?.abort();
                     }
                 }
             },
 
             failedRequestHandler({ request, error }) {
-                log.error(`❌ Failed: ${request.url} – ${error?.message || error}`);
+                log.error(`❌ Request failed: ${request.url} | ${error.message}`);
             },
         });
 
-        await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1 } }]);
-        log.info(`🎉 Done. Total jobs scraped: ${saved}`);
+        await crawler.run([{ 
+            url: startUrl, 
+            userData: { label: 'SEARCH', page: 1 } 
+        }]);
+
+        log.info(`🎉 Scraping complete! Total jobs: ${saved}`);
     } catch (err) {
-        log.error('❌ Fatal error in run():', err);
+        log.error('❌ Fatal error:', err);
+        throw err;
     } finally {
         await Actor.exit();
     }
 }
 
-/**
- * 🔴 IMPORTANT: Make sure main is actually invoked.
- * On Apify and locally, this guarantees the actor runs (no silent exit).
- */
-run().catch((e) => {
-    log.error('❌ Top-level run error:', e);
-    process.exit(1);
-});
+await Actor.main(run);

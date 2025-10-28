@@ -2,15 +2,12 @@
   "name": "jooble-job-scraper",
   "version": "1.0.0",
   "type": "module",
-  "description": "Fast lightweight Jooble scraper using Apify SDK, Crawlee, and PlaywrightCrawler",
+  "description": "Fast lightweight Jooble scraper using Apify SDK, Crawlee, and CheerioCrawler",
   "scripts": {
-    "postinstall": "npx playwright install --with-deps chromium",
     "start": "node ./src/main.js"
   },
   "dependencies": {
     "apify": "^3.3.0",
-    "crawlee": "^3.7.0",
-    "playwright": "^1.48.0",
-    "cheerio": "^1.0.0-rc.12"
+    "crawlee": "^3.7.0"
   }
 }
