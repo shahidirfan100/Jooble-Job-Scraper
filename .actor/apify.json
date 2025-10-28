@@ -1,0 +1,11 @@
+{
+  "name": "jooble-playwright-scraper",
+  "version": "1.0.0",
+  "description": "Playwright-based Jooble scraper using Apify SDK and Crawlee",
+  "baseDockerImage": "apify/actor-node-playwright-chrome:latest",
+  "defaultRunOptions": {
+    "buildTag": "latest",
+    "memoryMbytes": 2048,
+    "timeoutSecs": 1200
+  }
+}
