@@ -173,10 +173,17 @@ export async function main() {
     
     const input = await getInput();
 
-    // Create proxy configuration using Apify SDK
-    const proxyConfiguration = input.proxyConfiguration 
-        ? await Actor.createProxyConfiguration(input.proxyConfiguration)
-        : undefined;
+    // Create proxy configuration - Apify will use datacenter proxies by default
+    let proxyConfiguration;
+    try {
+        if (input.proxyConfiguration && input.proxyConfiguration.useApifyProxy) {
+            proxyConfiguration = await Actor.createProxyConfiguration({
+                groups: input.proxyConfiguration.apifyProxyGroups || ['RESIDENTIAL'],
+            });
+        }
+    } catch (err) {
+        log.warning(`Failed to create proxy configuration: ${err.message}. Continuing without proxy.`);
+    }
 
     const crawler = new CheerioCrawler({
         proxyConfiguration,
