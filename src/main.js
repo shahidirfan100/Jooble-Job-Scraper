@@ -1,13 +1,14 @@
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, Dataset, sleep } from 'crawlee';
 import { load as loadCheerio } from 'cheerio';
-import got from 'got-scraping';
+import { gotScraping } from 'got-scraping'; // ✅ correct named import
 
 const BASE_URL = 'https://jooble.org';
-const DETAIL_BATCH = 5;
-const MAX_RETRIES = 2;
+const DETAIL_BATCH = 5; // concurrent detail tabs
+const MAX_RETRIES = 2; // per search page
 
-// --- helpers ------------------------------------------------------
+// -------------------- Helpers ----------------------
+
 function randomUA() {
     const UAS = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36',
@@ -16,15 +17,20 @@ function randomUA() {
     ];
     return UAS[Math.floor(Math.random() * UAS.length)];
 }
+
 function extractJobLinks(html, base) {
     const $ = loadCheerio(html);
-    const set = new Set();
-    $('a[href*="/desc/"]').each((_, el) => {
+    const links = new Set();
+    $('a[href*="/desc/"], a[data-qa="vacancy-serp__vacancy-title"], a[class*="job-link"]').each((_, el) => {
         const href = $(el).attr('href');
-        if (href) set.add(href.startsWith('http') ? href : new URL(href, base).href);
+        if (href) {
+            const abs = href.startsWith('http') ? href : new URL(href, base).href;
+            if (abs.includes('/desc/')) links.add(abs);
+        }
     });
-    return [...set];
+    return [...links];
 }
+
 async function extractJobData(page, url) {
     const job = {
         title: '',
@@ -35,39 +41,62 @@ async function extractJobData(page, url) {
         job_url: url,
         scrapedAt: new Date().toISOString(),
     };
+
     try {
         job.title = (await page.textContent('h1, .job-title, .vacancy-title').catch(() => ''))?.trim() || '';
         job.company = (await page.textContent('.company, .employer, .company-name').catch(() => ''))?.trim() || '';
         job.location = (await page.textContent('.location, .job-location').catch(() => ''))?.trim() || '';
         job.salary = (await page.textContent('.salary, .compensation').catch(() => ''))?.trim() || '';
         job.description =
-            (await page.textContent('.job-description, main, article').catch(() => ''))?.trim().slice(0, 4000) || '';
-    } catch {}
+            (await page.textContent('.job-description, .vacancy-description, main, article').catch(() => ''))
+                ?.trim()
+                .slice(0, 4000) || '';
+    } catch (err) {
+        log.warning(`⚠️ Error parsing ${url}: ${err.message}`);
+    }
     return job;
 }
+
 function chunk(arr, n) {
     const out = [];
     for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
     return out;
 }
 
-// --- optional: auto-fetch consent cookie --------------------------
+// Fetch consent cookie (if EU / blocked)
 async function getConsentCookie() {
     try {
-        const res = await got(`${BASE_URL}/SearchResult?ukw=test`, { timeout: 8000 });
-        const cookie = (res.headers['set-cookie'] || []).find(c => c.includes('consent'));
-        if (cookie) log.info('✅ Fetched consent cookie');
-        return cookie?.split(';')[0];
-    } catch {
-        log.warning('⚠️ Consent cookie fetch failed');
+        const res = await gotScraping({
+            url: `${BASE_URL}/SearchResult?ukw=test`,
+            timeout: { request: 8000 },
+        });
+        const cookie = (res.headers['set-cookie'] || []).find((c) => c.includes('consent'));
+        if (cookie) {
+            log.info('✅ Fetched consent cookie');
+            return cookie.split(';')[0];
+        }
+        log.info('ℹ️ No consent cookie found');
+        return null;
+    } catch (err) {
+        log.warning('⚠️ Consent cookie fetch failed: ' + err.message);
         return null;
     }
 }
 
-// --- main ---------------------------------------------------------
+// -------------------- Main ----------------------
+
 await Actor.init();
+
 const input = (await Actor.getInput()) || {};
-const { searchQuery = 'developer', maxPages = 3, maxItems = 20, fastMode = true } = input;
+const {
+    searchQuery = 'developer',
+    maxPages = 3,
+    maxItems = 20,
+    fastMode = true,
+    detailConcurrency = DETAIL_BATCH,
+} = input;
+
+log.info(`🎬 Jooble scraper started | query="${searchQuery}" maxPages=${maxPages} maxItems=${maxItems}`);
 
 const proxyConfiguration = await Actor.createProxyConfiguration({
     useApifyProxy: true,
@@ -89,14 +118,19 @@ const crawler = new PlaywrightCrawler({
     launchContext: {
         launchOptions: {
             headless: true,
-            args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+            args: [
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-gpu',
+            ],
         },
     },
 
     preNavigationHooks: [
-        async ({ page, session }) => {
-            // resource blocking
-            await page.route('**/*', route => {
+        async ({ page }) => {
+            // block heavy resources
+            await page.route('**/*', (route) => {
                 const t = route.request().resourceType();
                 if (['image', 'stylesheet', 'font', 'media'].includes(t)) route.abort();
                 else route.continue();
@@ -104,43 +138,53 @@ const crawler = new PlaywrightCrawler({
             // stealth
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = { runtime: {} };
             });
-            // rotating UA & cookie
-            const ua = randomUA();
-            await page.setUserAgent(ua);
-            if (consentCookie) await page.context().addCookies([{ name: 'consent', value: 'true', domain: 'jooble.org' }]);
+            await page.setUserAgent(randomUA());
+            if (consentCookie) {
+                const [name, value] = consentCookie.split('=');
+                await page.context().addCookies([{ name, value, domain: 'jooble.org' }]);
+            }
         },
     ],
 
     async requestHandler({ page, request, crawler, session }) {
         const label = request.userData?.label || 'SEARCH';
         const pageNum = request.userData?.page || 1;
+        const retries = request.userData?.retries || 0;
 
         try {
             await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
         } catch (e) {
             log.warning(`⏱️ Timeout on ${request.url}`);
             session.retire();
-            throw e;
+            if (retries < MAX_RETRIES) {
+                await crawler.addRequests([{ url: request.url, userData: { ...request.userData, retries: retries + 1 } }]);
+            }
+            return;
         }
 
         const html = await page.content();
         if (/captcha|verify|are you human|403 Forbidden/i.test(html)) {
             log.warning(`🚧 Blocked at ${request.url}`);
             session.retire();
-            throw new Error('Blocked');
+            if (retries < MAX_RETRIES) {
+                await crawler.addRequests([{ url: request.url, userData: { ...request.userData, retries: retries + 1 } }]);
+            }
+            return;
         }
 
         if (label === 'SEARCH') {
             const jobLinks = extractJobLinks(html, request.url);
-            log.info(`🔎 Page ${pageNum}: ${jobLinks.length} job links`);
+            log.info(`🔎 Page ${pageNum}: found ${jobLinks.length} job links`);
             const limited = jobLinks.slice(0, maxItems - saved);
-            for (const group of chunk(limited, DETAIL_BATCH)) {
+            const batches = chunk(limited, detailConcurrency);
+
+            for (const batch of batches) {
                 await Promise.allSettled(
-                    group.map(async url => {
+                    batch.map(async (url) => {
                         const detail = await crawler.browserPool.newPage();
                         try {
                             await detail.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -155,10 +199,10 @@ const crawler = new PlaywrightCrawler({
                         } finally {
                             await detail.close().catch(() => {});
                         }
-                    })
+                    }),
                 );
-                await sleep(800 + Math.random() * 500);
                 if (saved >= maxItems) return;
+                await sleep(800 + Math.random() * 500);
             }
 
             if (pageNum < maxPages && saved < maxItems) {
