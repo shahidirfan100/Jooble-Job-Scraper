@@ -161,13 +161,13 @@ const crawler = new PlaywrightCrawler({
     },
 
     preNavigationHooks: [
-        async ({ page, request, addInterceptRequestHandler }) => {
+        async ({ page, request }) => {
             const userAgent = getRandomUA();
             
             // Intercept ALL requests to modify headers and bypass 403 detection
-            await addInterceptRequestHandler((route, interceptedRequest) => {
+            await page.route('**/*', (route) => {
                 const headers = {
-                    ...interceptedRequest.headers(),
+                    ...route.request().headers(),
                     'User-Agent': userAgent,
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.9',
@@ -181,7 +181,7 @@ const crawler = new PlaywrightCrawler({
                     'DNT': '1',
                 };
                 
-                // Remove automation headers
+                // Remove automation headers that trigger 403
                 delete headers['sec-ch-ua'];
                 delete headers['sec-ch-ua-mobile'];
                 delete headers['sec-ch-ua-platform'];
