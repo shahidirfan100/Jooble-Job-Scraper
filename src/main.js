@@ -1,5 +1,6 @@
 /* ────────────────────────────────────────────────────────────── *
- *  Jooble job scraper – Apify Actor (ESM, Crawlee, resilient)    *
+ *  Jooble job scraper – Apify Actor (ESM, Crawlee safe version)  *
+ *  Compatible with Apify platform images and Crawlee 3.x+        *
  * ────────────────────────────────────────────────────────────── */
 
 import { Actor, log } from 'apify';
@@ -18,87 +19,66 @@ async function getInput() {
         maxPages: 5,
         maxConcurrency: 10,
         proxyConfiguration: { useApifyProxy: true },
-        requestHeaders: {
-            'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept':
-                'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Upgrade-Insecure-Requests': '1',
-        },
+        userAgents: [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+        ],
     };
 
     const input = { ...defaults, ...(raw || {}) };
-    input.maxPages = Number.isFinite(+input.maxPages) && +input.maxPages > 0 ? +input.maxPages : 1;
-    input.maxConcurrency = Number.isFinite(+input.maxConcurrency) && +input.maxConcurrency > 0 ? +input.maxConcurrency : 5;
+    input.maxPages = +input.maxPages > 0 ? +input.maxPages : 1;
+    input.maxConcurrency = +input.maxConcurrency > 0 ? +input.maxConcurrency : 5;
     return input;
 }
 
 // ------------------------------------------------------------------
-// 2️⃣  BUILD SEARCH URL
+// 2️⃣  URL BUILDER
 // ------------------------------------------------------------------
 function buildSearchUrl({ searchQuery, location, page = 1, jobAge = 'all' }) {
     const base = 'https://jooble.org/SearchResult';
-    const params = new URLSearchParams();
-    if (searchQuery && searchQuery.trim()) params.set('ukw', searchQuery.trim());
-    if (location && location.trim()) params.set('l', location.trim());
-    if (page > 1) params.set('p', String(page));
-    if (jobAge && jobAge !== 'all') params.set('date', String(jobAge));
-    const qs = params.toString();
+    const p = new URLSearchParams();
+    if (searchQuery) p.set('ukw', searchQuery.trim());
+    if (location) p.set('l', location.trim());
+    if (page > 1) p.set('p', String(page));
+    if (jobAge !== 'all') p.set('date', String(jobAge));
+    const qs = p.toString();
     return qs ? `${base}?${qs}` : base;
 }
 
 // ------------------------------------------------------------------
-// 3️⃣  USER-AGENT POOL
-// ------------------------------------------------------------------
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-];
-
-// ------------------------------------------------------------------
-// 4️⃣  MAIN ACTOR FUNCTION
+// 3️⃣  MAIN ACTOR
 // ------------------------------------------------------------------
 export async function main() {
     await Actor.init();
 
     try {
         const input = await getInput();
-        log.info(`🎬 Starting Jooble scraper | query="${input.searchQuery}" | pages=${input.maxPages}`);
-
         const proxyConfiguration = await Actor.createProxyConfiguration(input.proxyConfiguration);
+        log.info(`🎬 Starting Jooble scraper | query="${input.searchQuery}"`);
 
         const crawler = new CheerioCrawler({
             proxyConfiguration,
-            maxConcurrency: input.maxConcurrency,
-            requestHandlerTimeoutSecs: 90,
             useSessionPool: true,
             persistCookiesPerSession: true,
-
-            // Supported option for global headers
-            additionalHttpHeaders: { ...input.requestHeaders },
+            maxConcurrency: input.maxConcurrency,
+            requestHandlerTimeoutSecs: 90,
 
             async requestHandler(context) {
-                const { $, request, enqueueLinks, session, proxyInfo } = context;
+                const { request, $, enqueueLinks, session } = context;
                 const label = request.userData?.label ?? 'SEARCH';
                 const page = request.userData?.page ?? 1;
 
-                // 🧱 Cookie / Bot wall detection
-                const htmlText = $.root().text().toLowerCase();
-                if (/are you human|verify you are human|captcha|cookie consent/i.test(htmlText)) {
+                // ------------------- Cookie wall detection -------------------
+                const bodyText = $.root().text().toLowerCase();
+                if (/are you human|verify you are human|captcha|cookie/i.test(bodyText)) {
                     const retries = request.userData?.retries ?? 0;
-                    log.warning(`🚧 Detected cookie/bot wall on ${request.url} (retry ${retries})`);
+                    log.warning(`🚧 Cookie/bot wall detected on ${request.url} (retry ${retries})`);
                     if (retries < 3) {
-                        // Rotate UA + new session
-                        const newUA = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+                        session.retire();
+                        const newUA = input.userAgents[Math.floor(Math.random() * input.userAgents.length)];
                         request.headers['User-Agent'] = newUA;
-                        if (session) {
-                            session.retire();
-                            log.info(`🔄 Retired session due to block. New session will be created.`);
-                        }
-                        // Wait 2–5 s before retry
                         await Actor.sleep(2000 + Math.random() * 3000);
                         await enqueueLinks({
                             urls: [request.url],
@@ -113,6 +93,7 @@ export async function main() {
                     return;
                 }
 
+                // ------------------- Normal flow -------------------
                 if (label === 'SEARCH') {
                     await handleSearchPage(context, input);
                 } else if (label === 'DETAIL') {
@@ -136,6 +117,11 @@ export async function main() {
                     jobAge: input.jobAge,
                 }),
                 userData: { label: 'SEARCH', page: 1 },
+                headers: {
+                    'User-Agent': input.userAgents[Math.floor(Math.random() * input.userAgents.length)],
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                },
             },
         ]);
 
@@ -149,27 +135,30 @@ export async function main() {
 }
 
 // ------------------------------------------------------------------
-// 5️⃣  SEARCH-RESULT PAGE HANDLER
+// 4️⃣  SEARCH PAGE HANDLER
 // ------------------------------------------------------------------
 async function handleSearchPage({ $, enqueueLinks, request }, input) {
     const currentPage = request.userData?.page ?? 1;
-    log.info(`🔍 Scraping search page ${currentPage}: ${request.url}`);
+    log.info(`🔍 Page ${currentPage}: ${request.url}`);
 
     const jobLinks = [];
     $('a[href*="/desc/"]').each((_, el) => {
         const href = $(el).attr('href');
         if (!href || !href.includes('/desc/')) return;
-        const fullUrl = href.startsWith('http') ? href : `https://jooble.org${href}`;
-        if (!jobLinks.includes(fullUrl)) jobLinks.push(fullUrl);
+        const full = href.startsWith('http') ? href : `https://jooble.org${href}`;
+        jobLinks.push(full);
     });
 
-    log.info(`   Found ${jobLinks.length} job links on page ${currentPage}`);
+    log.info(`   Found ${jobLinks.length} job links`);
 
     if (jobLinks.length) {
         await enqueueLinks({
             urls: jobLinks,
             transformRequestFunction: (req) => {
                 req.userData = { label: 'DETAIL', searchPage: currentPage };
+                req.headers = {
+                    'User-Agent': input.userAgents[Math.floor(Math.random() * input.userAgents.length)],
+                };
                 return req;
             },
         });
@@ -177,34 +166,35 @@ async function handleSearchPage({ $, enqueueLinks, request }, input) {
 
     if (currentPage < input.maxPages && jobLinks.length > 0) {
         const nextPage = currentPage + 1;
-        const nextPageUrl = buildSearchUrl({
+        const nextUrl = buildSearchUrl({
             searchQuery: input.searchQuery,
             location: input.location,
             page: nextPage,
             jobAge: input.jobAge,
         });
-        log.info(`   ➡️ Enqueuing next page: ${nextPage}`);
+        log.info(`   ➡️ Enqueuing next page ${nextPage}`);
         await enqueueLinks({
-            urls: [nextPageUrl],
+            urls: [nextUrl],
             transformRequestFunction: (req) => {
                 req.userData = { label: 'SEARCH', page: nextPage };
+                req.headers = {
+                    'User-Agent': input.userAgents[Math.floor(Math.random() * input.userAgents.length)],
+                };
                 return req;
             },
         });
-    } else {
-        log.info(`   ⏹️ Stopping pagination at page ${currentPage}`);
     }
 }
 
 // ------------------------------------------------------------------
-// 6️⃣  JOB-DETAIL PAGE HANDLER
+// 5️⃣  DETAIL PAGE HANDLER
 // ------------------------------------------------------------------
 async function handleDetailPage($, request) {
-    log.info(`📄 Scraping job detail: ${request.url}`);
+    log.info(`📄 Job detail: ${request.url}`);
 
     const getFirst = (sels) => {
-        for (const sel of sels) {
-            const txt = $(sel).first().text().trim();
+        for (const s of sels) {
+            const txt = $(s).first().text().trim();
             if (txt) return txt;
         }
         return '';
@@ -214,7 +204,6 @@ async function handleDetailPage($, request) {
     const company = getFirst(['.company', '.employer', '.company-name']);
     const location = getFirst(['.location', '.job-location']);
     const salary = getFirst(['.salary', '.pay', '.compensation']);
-
     const descNode = $('.job-description, .description, .vacancy-description, .content, main').first();
     const description_html = descNode.html() || '';
     const description_text = descNode.text().replace(/\s+/g, ' ').trim() || '';
@@ -235,17 +224,17 @@ async function handleDetailPage($, request) {
         await Dataset.pushData(job);
         log.info(`   ✅ Saved: "${job.title}"`);
     } else {
-        log.warning(`   ⚠️ No title found for ${request.url}`);
+        log.warning(`   ⚠️ Missing title at ${request.url}`);
     }
 }
 
 // ------------------------------------------------------------------
-// 7️⃣  LOCAL TEST ENTRY
+// 6️⃣  LOCAL RUN SUPPORT
 // ------------------------------------------------------------------
 if (import.meta.url === `file://${process.argv[1]}`) {
     main().catch((e) => {
-        log.error('❌ Unexpected error in main():', e);
-        if (e?.stack) console.error(e.stack);
+        log.error('❌ Fatal error:', e);
+        console.error(e.stack);
         process.exit(1);
     });
 }
