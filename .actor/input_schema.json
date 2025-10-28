@@ -9,7 +9,7 @@
       "type": "array",
       "description": "Start scraping from specific Jooble search result URLs. If provided, these will override searchQuery.",
       "items": { "type": "string", "format": "uri" },
-      "editor": "text"
+      "editor": "select"
     },
     "searchQuery": {
       "title": "Search query (if not using Start URLs)",
