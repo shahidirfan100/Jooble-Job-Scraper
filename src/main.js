@@ -16,6 +16,21 @@ async function main() {
         const MAX_ITEMS = Number.isFinite(+MAX_ITEMS_RAW) ? Math.max(1, +MAX_ITEMS_RAW) : Number.MAX_SAFE_INTEGER;
         const MAX_PAGES = 999;
 
+        // Handle startUrls as string (JSON) or array
+        let parsedStartUrls = [];
+        if (startUrls) {
+            if (typeof startUrls === 'string') {
+                try {
+                    parsedStartUrls = JSON.parse(startUrls);
+                    if (!Array.isArray(parsedStartUrls)) parsedStartUrls = [];
+                } catch {
+                    parsedStartUrls = [];
+                }
+            } else if (Array.isArray(startUrls)) {
+                parsedStartUrls = startUrls;
+            }
+        }
+
         const toAbs = (href, base = 'https://jooble.org') => {
             try { return new URL(href, base).href; } catch { return null; }
         };
@@ -34,7 +49,7 @@ async function main() {
         };
 
         const initial = [];
-        if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
+        if (parsedStartUrls.length) initial.push(...parsedStartUrls);
         if (startUrl) initial.push(startUrl);
         if (!initial.length) initial.push(buildStartUrl(searchQuery));
 

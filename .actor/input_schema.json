@@ -6,10 +6,9 @@
   "properties": {
     "startUrls": {
       "title": "Start URLs",
-      "type": "array",
-      "description": "Start scraping from specific Jooble search result URLs. If provided, these will override searchQuery.",
-      "items": { "type": "string", "format": "uri" },
-      "editor": "json"
+      "type": "string",
+      "description": "Start scraping from specific Jooble search result URLs as a JSON array, e.g., [\"https://jooble.org/SearchResult?ukw=admin\"]. If provided, these will override searchQuery.",
+      "editor": "textarea"
     },
     "searchQuery": {
       "title": "Search query (if not using Start URLs)",
