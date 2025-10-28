@@ -327,3 +327,5 @@ export async function main() {
         await Actor.exit();
     }
 }
+
+await main();
