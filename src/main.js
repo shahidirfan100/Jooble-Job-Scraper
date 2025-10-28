@@ -63,23 +63,26 @@ function chunk(arr, n) {
     return out;
 }
 
-// Auto-fetch consent cookie (EU regions)
-async function getConsentCookie() {
+// ---------- Warm-up cookies before crawling ----------
+
+async function warmupCookies(proxyConfiguration) {
     try {
+        const proxyUrl = proxyConfiguration.newUrl();
         const res = await gotScraping({
-            url: `${BASE_URL}/SearchResult?ukw=test`,
+            url: BASE_URL,
+            proxyUrl,
             timeout: { request: 8000 },
         });
-        const cookie = (res.headers['set-cookie'] || []).find((c) => c.includes('consent'));
-        if (cookie) {
-            log.info('✅ Fetched consent cookie');
-            return cookie.split(';')[0];
+        const cookies = res.headers['set-cookie'] || [];
+        if (cookies.length) {
+            log.info(`✅ Warm-up cookies received (${cookies.length})`);
+        } else {
+            log.info('ℹ️ No cookies set during warm-up');
         }
-        log.info('ℹ️ No consent cookie found');
-        return null;
+        return cookies;
     } catch (err) {
-        log.warning('⚠️ Consent cookie fetch failed: ' + err.message);
-        return null;
+        log.warning('⚠️ Warm-up cookie fetch failed: ' + err.message);
+        return [];
     }
 }
 
@@ -92,26 +95,28 @@ const {
     searchQuery = 'developer',
     maxPages = 3,
     maxItems = 20,
-    fastMode = true,
     detailConcurrency = DETAIL_BATCH,
 } = input;
 
 log.info(`🎬 Jooble scraper started | query="${searchQuery}" maxPages=${maxPages} maxItems=${maxItems}`);
 
+// Force residential proxy group to bypass 403
 const proxyConfiguration = await Actor.createProxyConfiguration({
     useApifyProxy: true,
-    apifyProxyGroups: fastMode ? [] : ['RESIDENTIAL'],
+    apifyProxyGroups: ['RESIDENTIAL'],
+    countryCode: 'US',
 });
-log.info('✅ Proxy configured');
+log.info('✅ Residential proxy configured');
 
-const consentCookie = await getConsentCookie();
+const warmupCookiesList = await warmupCookies(proxyConfiguration);
 let saved = 0;
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
-    navigationTimeoutSecs: 20,
-    requestHandlerTimeoutSecs: 45,
+    navigationTimeoutSecs: 25,
+    requestHandlerTimeoutSecs: 50,
     maxRequestsPerCrawl: maxPages * 20,
+    maxConcurrency: 2,
     useSessionPool: true,
     sessionPoolOptions: { maxPoolSize: 20, sessionOptions: { maxUsageCount: 3 } },
 
@@ -129,33 +134,42 @@ const crawler = new PlaywrightCrawler({
 
     preNavigationHooks: [
         async ({ page }) => {
-            // block heavy resources
+            const ua = randomUA();
+            const headers = {
+                'User-Agent': ua,
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Sec-CH-UA': '"Chromium";v="128", "Not:A-Brand";v="99"',
+                'Sec-CH-UA-Mobile': '?0',
+                'Sec-CH-UA-Platform': '"Windows"',
+                'Upgrade-Insecure-Requests': '1',
+                'Accept':
+                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            };
+            await page.context().setExtraHTTPHeaders(headers);
+
             await page.route('**/*', (route) => {
                 const t = route.request().resourceType();
                 if (['image', 'stylesheet', 'font', 'media'].includes(t)) route.abort();
                 else route.continue();
             });
 
-            // stealth
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
             });
 
-            // ✅ Correct way to set UA in Playwright (via context)
-            const ua = randomUA();
-            await page.context().setExtraHTTPHeaders({
-                'User-Agent': ua,
-                'Accept-Language': 'en-US,en;q=0.9',
-            });
-
-            // consent cookie
-            if (consentCookie) {
-                const [name, value] = consentCookie.split('=');
-                await page.context().addCookies([{ name, value, domain: 'jooble.org' }]);
+            // Add cookies from warmup
+            if (warmupCookiesList.length) {
+                const parsed = warmupCookiesList.map((c) => {
+                    const [name, value] = c.split(';')[0].split('=');
+                    return { name, value, domain: 'jooble.org' };
+                });
+                await page.context().addCookies(parsed);
             }
+
+            await page.setViewportSize({ width: 1366, height: 768 });
         },
     ],
 
@@ -165,7 +179,8 @@ const crawler = new PlaywrightCrawler({
         const retries = request.userData?.retries || 0;
 
         try {
-            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            await sleep(500 + Math.random() * 1000); // human delay
+            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 25000 });
         } catch (e) {
             log.warning(`⏱️ Timeout on ${request.url}`);
             session.retire();
@@ -227,7 +242,6 @@ const crawler = new PlaywrightCrawler({
     },
 });
 
-// Start crawling
 const startUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}`;
 await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1 } }]);
 
