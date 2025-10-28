@@ -130,8 +130,6 @@ const crawler = new PlaywrightCrawler({
     requestHandlerTimeoutSecs: 120,
     maxRequestRetries: 3,
     
-    ignoreSslErrors: true,
-    
     useSessionPool: true,
     sessionPoolOptions: {
         maxPoolSize: 15,
