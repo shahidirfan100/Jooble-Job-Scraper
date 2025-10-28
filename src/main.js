@@ -1,38 +1,20 @@
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, Dataset } from 'crawlee';
-import { chromium } from 'playwright';
+import { load as loadCheerio } from 'cheerio';
 
 const BASE_URL = 'https://jooble.org';
 
-// Enhanced stealth configuration
-const STEALTH_CONFIG = {
-    contexts: [
-        'chrome-windows',
-        'chrome-macos'
-    ],
-    languages: ['en-US', 'en'],
-    screen: {
-        width: 1920,
-        height: 1080
-    }
-};
-
 function extractJobLinks(html, pageUrl) {
     const links = new Set();
-    // Match href patterns for job links
     const hrefPattern = /href="([^"]*(?:\/desc\/|vacancy)[^"]*)"/gi;
     let match;
-    
     while ((match = hrefPattern.exec(html)) !== null) {
         const href = match[1];
         if (!href.includes('/SearchResult') && !href.includes('?ukw=')) {
             const abs = href.startsWith('http') ? href : new URL(href, pageUrl).href;
-            if (abs.includes('/desc/') || abs.includes('vacancy')) {
-                links.add(abs);
-            }
+            if (abs.includes('/desc/') || abs.includes('vacancy')) links.add(abs);
         }
     }
-    
     return [...links];
 }
 
@@ -46,55 +28,44 @@ async function extractJobData(page, url) {
         job_type: '',
         description: '',
         job_url: url,
-        scrapedAt: new Date().toISOString()
+        scrapedAt: new Date().toISOString(),
     };
 
     try {
-        // Try JSON-LD first (most reliable)
         const jsonLd = await page.$$eval('script[type="application/ld+json"]', scripts => {
-            for (const script of scripts) {
+            for (const s of scripts) {
                 try {
-                    const json = JSON.parse(script.textContent || '{}');
+                    const json = JSON.parse(s.textContent || '{}');
                     if (json['@type'] === 'JobPosting') return json;
-                } catch (e) {}
+                } catch (_) {}
             }
             return null;
-        }).catch(() => null);
+        });
 
         if (jsonLd) {
             data.title = jsonLd.title || '';
             data.company = jsonLd.hiringOrganization?.name || '';
-            data.location = jsonLd.jobLocation?.address?.addressLocality || 
-                           jsonLd.jobLocation?.address?.addressRegion || '';
-            data.salary = jsonLd.baseSalary?.value?.value || jsonLd.baseSalary?.minValue || '';
+            data.location = jsonLd.jobLocation?.address?.addressLocality || '';
+            data.salary = jsonLd.baseSalary?.value?.value || '';
             data.date_posted = jsonLd.datePosted || '';
             data.job_type = jsonLd.employmentType || '';
             data.description = jsonLd.description || '';
         }
 
-        // Fallback to DOM selectors
-        if (!data.title) {
-            data.title = await page.locator('h1, .job-title, .vacancy-title, [data-qa="vacancy-title"]').first().textContent().catch(() => '') || '';
-        }
-        
-        if (!data.company) {
-            data.company = await page.locator('.company, .employer, .company-name, [data-qa="vacancy-company-name"]').first().textContent().catch(() => '') || '';
-        }
-        
-        if (!data.location) {
-            data.location = await page.locator('.location, .job-location, [data-qa="vacancy-view-location"]').first().textContent().catch(() => '') || '';
-        }
-        
-        if (!data.salary) {
-            data.salary = await page.locator('.salary, .compensation, [data-qa="vacancy-salary"]').first().textContent().catch(() => '') || '';
-        }
-        
-        if (!data.description) {
-            data.description = await page.locator('.job-description, .description, .vacancy-description, [data-qa="vacancy-description"], main, article').first().textContent().catch(() => '') || '';
-            data.description = data.description.trim().substring(0, 5000);
-        }
+        if (!data.title)
+            data.title = await page.locator('h1, .job-title, .vacancy-title').first().textContent().catch(() => '') || '';
+        if (!data.company)
+            data.company = await page.locator('.company, .employer, .company-name').first().textContent().catch(() => '') || '';
+        if (!data.location)
+            data.location = await page.locator('.location, .job-location').first().textContent().catch(() => '') || '';
+        if (!data.salary)
+            data.salary = await page.locator('.salary, .compensation').first().textContent().catch(() => '') || '';
+        if (!data.description)
+            data.description = (await page.locator('.job-description, main, article').first().textContent().catch(() => ''))
+                .trim()
+                .substring(0, 5000);
     } catch (err) {
-        log.warning(`Error extracting data: ${err.message}`);
+        log.warning(`Error extracting job data: ${err.message}`);
     }
 
     return data;
@@ -106,162 +77,105 @@ async function run() {
 
     try {
         const input = (await Actor.getInput()) || {};
-        const {
-            searchQuery = 'developer',
-            maxPages = 3,
-            maxItems = 50,
-            maxConcurrency = 2,
-            proxyConfiguration: inputProxyConfig
-        } = input;
+        const { searchQuery = 'developer', maxPages = 3, maxItems = 20, proxyConfiguration: inputProxyConfig } = input;
 
         log.info(`🎬 Jooble scraper started | query="${searchQuery}" maxPages=${maxPages} maxItems=${maxItems}`);
 
-        // Create proxy configuration
+        // ✅ Proxy setup
         let proxyConfiguration;
         try {
-            if (inputProxyConfig?.useApifyProxy) {
-                proxyConfiguration = await Actor.createProxyConfiguration(inputProxyConfig);
-            } else {
-                proxyConfiguration = await Actor.createProxyConfiguration();
-            }
+            proxyConfiguration = await Actor.createProxyConfiguration(
+                inputProxyConfig?.useApifyProxy ? inputProxyConfig : { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+            );
             log.info('✅ Proxy configured');
-        } catch (e) {
-            log.warning('⚠️ No proxy, continuing without');
-            proxyConfiguration = undefined;
+        } catch {
+            log.warning('⚠️ Proxy not available, continuing without');
         }
 
         const startUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}`;
-        
+
+        // ✅ Fixed PlaywrightCrawler constructor
         const crawler = new PlaywrightCrawler({
             proxyConfiguration,
-            maxConcurrency,
-            maxRequestRetries: 3,
+            headless: true,
+            maxRequestsPerCrawl: maxPages * 20, // prevents infinite crawl loops
             requestHandlerTimeoutSecs: 90,
             navigationTimeoutSecs: 60,
-            headless: true,
-            
-            // Browser launch options with stealth
+            useSessionPool: true,
             launchContext: {
-                launcher: chromium,
                 launchOptions: {
                     headless: true,
                     args: [
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
                         '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-web-security',
-                        '--disable-features=IsolateOrigins,site-per-process',
-                        '--window-size=1920,1080'
-                    ]
-                }
+                        '--disable-dev-shm-usage',
+                        '--disable-blink-features=AutomationControlled',
+                        '--window-size=1920,1080',
+                    ],
+                },
             },
-
-            // Pre-navigation stealth setup
-            async preNavigationHooks({ page, request }) {
-                // Stealth: Remove webdriver flags
-                await page.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                    
-                    // Override permissions
-                    const originalQuery = window.navigator.permissions.query;
-                    window.navigator.permissions.query = (parameters) => (
-                        parameters.name === 'notifications' ?
-                            Promise.resolve({ state: Notification.permission }) :
-                            originalQuery(parameters)
-                    );
-                    
-                    // Chrome runtime
-                    window.chrome = { runtime: {} };
-                });
-
-                // Set realistic viewport
-                await page.setViewportSize(STEALTH_CONFIG.screen);
-                
-                log.debug(`➡️ Navigating: ${request.url}`);
-            },
-            
-            async requestHandler({ page, request, crawler }) {
+            preNavigationHooks: [
+                async ({ page }) => {
+                    // minimal stealth setup
+                    await page.addInitScript(() => {
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        window.chrome = { runtime: {} };
+                    });
+                    await page.setViewportSize({ width: 1920, height: 1080 });
+                },
+            ],
+            async requestHandler({ page, request, enqueueLinks, crawler }) {
                 const label = request.userData?.label || 'SEARCH';
                 const pageNum = request.userData?.page || 1;
 
-                // Wait for page to load
-                try {
-                    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-                    await page.waitForTimeout(1500 + Math.random() * 1000); // Human-like delay
-                } catch (e) {
-                    log.warning(`Timeout waiting for page load: ${request.url}`);
-                }
-
-                // Check for blocks/captcha
+                await page.waitForLoadState('domcontentloaded');
+                await page.waitForTimeout(1000 + Math.random() * 500);
                 const html = await page.content();
-                if (/blocked|captcha|verify you are human|access denied/i.test(html)) {
+
+                if (/blocked|captcha|verify you are human/i.test(html)) {
                     log.warning(`🚧 Bot detection on ${request.url}`);
-                    throw new Error('Bot detection triggered');
+                    throw new Error('Blocked by bot wall');
                 }
 
                 if (label === 'SEARCH') {
                     const links = extractJobLinks(html, request.url);
                     log.info(`🔎 Page ${pageNum}: found ${links.length} job links`);
 
-                    if (links.length === 0) {
-                        log.warning(`No jobs found on page ${pageNum}. Page might be blocked or no results.`);
+                    if (!links.length) {
+                        log.warning(`No jobs on page ${pageNum}`);
                         return;
                     }
 
-                    // Enqueue job detail pages
-                    const remaining = maxItems - saved;
-                    for (const jobUrl of links.slice(0, Math.max(0, remaining))) {
-                        await crawler.addRequests([{
-                            url: jobUrl,
-                            userData: { label: 'DETAIL' }
-                        }]);
+                    for (const link of links.slice(0, maxItems - saved)) {
+                        await crawler.addRequests([{ url: link, userData: { label: 'DETAIL' } }]);
                     }
 
-                    // Pagination
-                    if (pageNum < maxPages && saved < maxItems && links.length > 0) {
-                        const nextPageNum = pageNum + 1;
-                        const nextUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}&p=${nextPageNum}`;
-                        await crawler.addRequests([{
-                            url: nextUrl,
-                            userData: { label: 'SEARCH', page: nextPageNum }
-                        }]);
-                        log.info(`📄 Queued page ${nextPageNum}`);
+                    if (pageNum < maxPages && saved < maxItems) {
+                        const nextUrl = `${BASE_URL}/SearchResult?ukw=${encodeURIComponent(searchQuery)}&p=${pageNum + 1}`;
+                        await crawler.addRequests([{ url: nextUrl, userData: { label: 'SEARCH', page: pageNum + 1 } }]);
+                        log.info(`📄 Queued next page ${pageNum + 1}`);
                     }
                     return;
                 }
 
                 if (label === 'DETAIL') {
-                    const jobData = await extractJobData(page, request.url);
-                    
-                    if (jobData.title) {
-                        await Dataset.pushData(jobData);
+                    const data = await extractJobData(page, request.url);
+                    if (data.title) {
+                        await Dataset.pushData(data);
                         saved++;
-                        log.info(`✅ Saved #${saved}: ${jobData.title.substring(0, 60)}`);
-                        
-                        // Stop if reached max
+                        log.info(`✅ Saved #${saved}: ${data.title}`);
                         if (saved >= maxItems) {
                             log.info(`🎯 Reached maxItems (${maxItems})`);
                             await crawler.autoscaledPool?.abort();
                         }
-                    } else {
-                        log.warning(`⚠️ No title found on ${request.url}`);
                     }
                 }
             },
-
             failedRequestHandler({ request, error }) {
                 log.error(`❌ Failed: ${request.url} | ${error.message}`);
             },
         });
 
-        await crawler.run([{ 
-            url: startUrl, 
-            userData: { label: 'SEARCH', page: 1 } 
-        }]);
-
+        await crawler.run([{ url: startUrl, userData: { label: 'SEARCH', page: 1 } }]);
         log.info(`🎉 Scraping complete! Total jobs: ${saved}`);
     } catch (err) {
         log.error('❌ Fatal error:', err);
@@ -271,4 +185,5 @@ async function run() {
     }
 }
 
+// ✅ Make sure it executes on start
 await Actor.main(run);
