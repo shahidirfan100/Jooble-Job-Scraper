@@ -8,9 +8,8 @@
       "title": "Start URLs",
       "type": "array",
       "description": "Start scraping from specific Jooble search result URLs. If provided, these will override searchQuery.",
-      "items": { "type": "string", "format": "uri", "enum": ["https://jooble.org/SearchResult?ukw=admin"] },
-      "editor": "select",
-      "default": ["https://jooble.org/SearchResult?ukw=admin"]
+      "items": { "type": "string", "format": "uri" },
+      "editor": "json"
     },
     "searchQuery": {
       "title": "Search query (if not using Start URLs)",
