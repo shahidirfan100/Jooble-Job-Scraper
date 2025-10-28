@@ -3,13 +3,14 @@
  *  – works with `"type": "module"` (ESM)                         *
  * ────────────────────────────────────────────────────────────── */
 
-import { CheerioCrawler, Dataset, KeyValueStore, log, ProxyConfiguration } from 'crawlee';
+import { CheerioCrawler, Dataset, log } from 'crawlee';
+import { Actor } from 'apify';
 
 // ------------------------------------------------------------------
 // 1️⃣  INPUT HANDLING
 // ------------------------------------------------------------------
 async function getInput() {
-    const raw = await KeyValueStore.getInput();
+    const raw = await Actor.getInput();
 
     const defaults = {
         searchQuery: 'software engineer',
@@ -167,9 +168,15 @@ const selectors = {
 // 4️⃣  MAIN ACTOR FUNCTION (exported for Apify)
 // ------------------------------------------------------------------
 export async function main() {
+    // Initialize Apify Actor (required for platform)
+    await Actor.init();
+    
     const input = await getInput();
 
-    const proxyConfiguration = await ProxyConfiguration(input.proxyConfiguration);
+    // Create proxy configuration using Apify SDK
+    const proxyConfiguration = input.proxyConfiguration 
+        ? await Actor.createProxyConfiguration(input.proxyConfiguration)
+        : undefined;
 
     const crawler = new CheerioCrawler({
         proxyConfiguration,
@@ -234,6 +241,9 @@ export async function main() {
     ]);
 
     log.info('✅ Crawling finished – check the default dataset for results.');
+    
+    // Exit Apify Actor
+    await Actor.exit();
 }
 
 // ------------------------------------------------------------------
