@@ -2,12 +2,13 @@
   "name": "jooble-job-scraper",
   "version": "1.0.0",
   "type": "module",
-  "description": "Fast lightweight Jooble scraper using Apify SDK, Crawlee, and CheerioCrawler",
+  "description": "Fast Jooble scraper using Apify SDK, Crawlee, and PlaywrightCrawler with stealth",
   "scripts": {
     "start": "node ./src/main.js"
   },
   "dependencies": {
     "apify": "^3.3.0",
-    "crawlee": "^3.7.0"
+    "crawlee": "^3.7.0",
+    "playwright": "^1.40.0"
   }
 }
