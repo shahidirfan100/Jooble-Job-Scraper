@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import json
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -54,6 +55,10 @@ def build_stealth_headers(referer: Optional[str] = None) -> Dict[str, str]:
             'Sec-Fetch-User': '?1',
             'DNT': '1',
             'Connection': 'keep-alive',
+            # Client hints commonly present
+            'sec-ch-ua': '"Chromium";v="127", "Not)A;Brand";v="24", "Google Chrome";v="127"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
         }
     if referer:
         headers['Referer'] = referer
@@ -82,6 +87,68 @@ def select_first_html(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional
     return None
 
 
+def extract_jobs_from_ld_json(page_soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    jobs: List[Dict[str, Any]] = []
+    for script in page_soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string or '')
+        except Exception:
+            continue
+        if not data:
+            continue
+        candidates = []
+        if isinstance(data, dict):
+            candidates = [data]
+        elif isinstance(data, list):
+            candidates = data
+        for obj in candidates:
+            try:
+                typ = obj.get('@type') if isinstance(obj, dict) else None
+                if isinstance(typ, list):
+                    is_job = any(t.lower() == 'jobposting' for t in typ if isinstance(t, str))
+                else:
+                    is_job = isinstance(typ, str) and typ.lower() == 'jobposting'
+                if not is_job:
+                    continue
+                title = obj.get('title') or obj.get('name')
+                hiring_org = obj.get('hiringOrganization') or {}
+                company = hiring_org.get('name') if isinstance(hiring_org, dict) else None
+                job_loc = obj.get('jobLocation') or {}
+                location = None
+                if isinstance(job_loc, dict):
+                    addr = job_loc.get('address') or {}
+                    if isinstance(addr, dict):
+                        location = addr.get('addressLocality') or addr.get('addressRegion') or addr.get('addressCountry')
+                descr = obj.get('description')
+                date_posted = obj.get('datePosted') or obj.get('datePublished')
+                salary = None
+                comp = obj.get('baseSalary') or {}
+                if isinstance(comp, dict):
+                    val = comp.get('value')
+                    if isinstance(val, dict):
+                        amount = val.get('value')
+                        unit = val.get('unitText')
+                        if amount:
+                            salary = f"{amount} {unit or ''}".strip()
+                url = obj.get('url')
+                item: Dict[str, Any] = {
+                    'job_title': title,
+                    'company': company,
+                    'location': location,
+                    'date_posted': date_posted,
+                    'job_type': None,
+                    'job_url': url,
+                    'description_text': BeautifulSoup(descr, 'lxml').get_text(strip=True) if isinstance(descr, str) else None,
+                    'description_html': descr if isinstance(descr, str) else None,
+                    'salary': salary,
+                }
+                if item['job_title'] or item['job_url']:
+                    jobs.append(item)
+            except Exception:
+                continue
+    return jobs
+
+
 def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
     """Try multiple strategies to identify job listing blocks on Jooble search pages."""
     candidates = []
@@ -97,6 +164,9 @@ def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
         'div[id^="job_" i]',
         'section[role="main"] article',
         'div[data-qa*="vacancy" i]',
+        # broader anchors possibly wrapped in list containers
+        'div[data-qa*="vacancy-item" i]',
+        'div[class*="vacancy" i]',
     ]
     for css in strategies:
         found = page_soup.select(css)
@@ -121,8 +191,15 @@ def parse_job_block(block: BeautifulSoup, page_url: str) -> Optional[Dict[str, A
         # Sometimes title anchor is nested
         title_el = block.select_one('a[href*="/job/"]')
     if not title_el:
-        # Additional Jooble variants
-        title_el = block.select_one('a[data-qa*="vacancy-title" i], h2 a, h3 a')
+        # Additional Jooble variants, including obfuscated multi-class link
+        title_el = block.select_one(
+            'a.job_card_link, '
+            'a[class*="job_card_link" i], '
+            'a._8w9Ce2.tUC4Fj._6i4Nb0.wtCvxI.job_card_link, '
+            'a[data-qa*="vacancy-title" i], '
+            'h2 a, h3 a, '
+            'a[href*="/jdp/"], a[href*="/jd/"], a[href*="/j/"], a[href*="redirect?"]'
+        )
 
     job_title = title_el.get_text(strip=True) if title_el else None
     href = title_el.get('href') if title_el else None
@@ -296,9 +373,7 @@ async def main() -> None:
                         soup = BeautifulSoup(html2, 'lxml')
                         blocks = extract_job_blocks(soup)
 
-                if not blocks:
-                    Actor.log.info('No job blocks detected on page, ending.')
-                    break
+                collected_any = False
 
                 new_items_on_page = 0
                 for block in blocks:
@@ -317,6 +392,25 @@ async def main() -> None:
                     new_items_on_page += 1
                     if job_url:
                         seen_urls.add(job_url)
+                    collected_any = True
+
+                if not collected_any:
+                    # Try JSON-LD fallback
+                    ld_jobs = extract_jobs_from_ld_json(soup)
+                    for item in ld_jobs:
+                        job_url = item.get('job_url')
+                        if job_url and job_url in seen_urls:
+                            continue
+                        item['source_url'] = url
+                        item['page_number'] = page
+                        await Actor.push_data(item)
+                        total_pushed += 1
+                        new_items_on_page += 1
+                        if job_url:
+                            seen_urls.add(job_url)
+                    if new_items_on_page == 0:
+                        Actor.log.info('No job blocks or JSON-LD jobs detected on page, ending.')
+                        break
 
                 Actor.log.info(f'Page {page}: pushed {new_items_on_page} new items (total {total_pushed}).')
 
