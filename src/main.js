@@ -7,7 +7,7 @@ import { load as cheerioLoad } from 'cheerio';
 // Helpers & Config
 // ───────────────────────────────────────────────────────────────
 const BASE_URL = 'https://jooble.org';
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 5;
 
 const UA_PROFILES = [
     {
@@ -168,12 +168,15 @@ export async function main() {
             maxPages = 3,
             maxConcurrency = 3,
             maxItems = 50,
+            startUrls,
+            proxyConfiguration: inputProxyConfiguration,
         } = input;
 
-        const proxyConfiguration = await Actor.createProxyConfiguration({
-            useApifyProxy: true,
-            apifyProxyGroups: ['RESIDENTIAL'],
-        });
+        const proxyConfiguration = await Actor.createProxyConfiguration(
+            inputProxyConfiguration && Object.keys(inputProxyConfiguration).length
+                ? inputProxyConfiguration
+                : { useApifyProxy: true }
+        );
 
         const crawler = new CheerioCrawler({
             proxyConfiguration,
@@ -182,6 +185,12 @@ export async function main() {
             maxConcurrency,
             maxRequestRetries: MAX_RETRIES,
             requestHandlerTimeoutSecs: 60,
+            sessionPoolOptions: {
+                maxPoolSize: Math.max(4, Math.min(30, maxConcurrency * 3)),
+                sessionOptions: {
+                    maxUsageCount: 15,
+                },
+            },
             async requestFunction({ request, session, proxyInfo }) {
                 const profile = getSessionProfile(session);
                 const referer = request.userData?.referer || `${BASE_URL}/`;
@@ -229,9 +238,15 @@ export async function main() {
                 const status = response?.statusCode ?? 0;
                 const $ = context.$ || cheerioLoad(body || '');
 
-                if (!body || status === 403 || status === 401 || isCookieOrBotWall(body)) {
-                    log.warning(`🚧 Blocked (${status}) on ${request.url}`);
-                    session?.retire();
+                // Handle blocking and throttling
+                if (!body || status === 401 || status === 403 || status === 429 || isCookieOrBotWall(body)) {
+                    log.warning(`🚧 Blocked/Throttled (${status}) on ${request.url}`);
+                    // 429 (Too Many Requests): mark session bad but not retire immediately
+                    if (status === 429) session?.markBad(); else session?.retire();
+                    // Exponential backoff based on retry count
+                    const attempt = (request.retryCount ?? 0) + 1;
+                    const backoffMs = Math.min(15000, 500 * 2 ** attempt + rand(0, 500));
+                    await sleep(backoffMs);
                     throw new Error(`Blocked ${status}`);
                 }
 
@@ -242,7 +257,13 @@ export async function main() {
                 if (label === 'SEARCH') {
                     if (saved >= maxItems) return;
 
+                    // Try to extract total results or detect empty result pages
+                    const possibleNoResults = $('h1:contains("no results"), .zero-result, .no-results').length > 0;
                     const links = extractDetailLinks($, request.url);
+                    if (links.length === 0 && possibleNoResults) {
+                        log.info(`ℹ️ No results detected on page ${page} — stopping pagination.`);
+                        return;
+                    }
                     log.info(`🔎 Page ${page}: ${links.length} potential jobs`);
 
                     for (const link of links) {
@@ -258,10 +279,17 @@ export async function main() {
                     }
 
                     if (page < maxPages && saved + plannedDetails < maxItems) {
-                        const next = new URL(request.url);
-                        next.searchParams.set('p', page + 1);
+                        // Find explicit next link first
+                        let nextHref = $('a[rel="next"], a.next, a:contains("Next")').attr('href');
+                        if (!nextHref) {
+                            const next = new URL(request.url);
+                            next.searchParams.set('p', page + 1);
+                            nextHref = next.href;
+                        } else {
+                            nextHref = nextHref.startsWith('http') ? nextHref : new URL(nextHref, request.url).href;
+                        }
                         await enqueueLinks({
-                            urls: [next.href],
+                            urls: [nextHref],
                             transformRequestFunction: (req) => {
                                 req.userData = { label: 'SEARCH', page: page + 1, referer: request.url };
                                 return req;
@@ -278,11 +306,46 @@ export async function main() {
                     }
                     if (saved >= maxItems) return;
 
-                    const title = $('h1, [data-test="vacancy-title"], .job-title, .title').first().text().trim();
-                    const company = $('[data-test="vacancy-company"], .company, .employer, .company-name').first().text().trim();
-                    const locationVal = $('[data-test="vacancy-location"], .location, .job-location').first().text().trim();
-                    const salary = $('[data-test="vacancy-salary"], .salary, .compensation').first().text().trim();
-                    const desc = $('[data-test="vacancy-description"], .job-description, .description, .vacancy-description, .content, main').first().text().replace(/\s+/g, ' ').trim();
+                    // Prefer JSON-LD JobPosting when available
+                    let title = '';
+                    let company = '';
+                    let locationVal = '';
+                    let salary = '';
+                    let descriptionHtml = '';
+                    let descriptionText = '';
+
+                    const jsonLd = [];
+                    $('script[type="application/ld+json"]').each((_, el) => {
+                        try {
+                            const txt = $(el).contents().text();
+                            if (!txt) return;
+                            const parsed = JSON.parse(txt);
+                            if (Array.isArray(parsed)) jsonLd.push(...parsed);
+                            else jsonLd.push(parsed);
+                        } catch { /* ignore */ }
+                    });
+
+                    const jobPosting = jsonLd.find((o) => o && (o['@type'] === 'JobPosting' || (Array.isArray(o['@type']) && o['@type'].includes('JobPosting'))));
+                    if (jobPosting) {
+                        title = jobPosting.title || '';
+                        company = jobPosting.hiringOrganization?.name || jobPosting.employerOverview?.name || '';
+                        locationVal = jobPosting.jobLocation?.address?.addressLocality || jobPosting.jobLocation?.address?.addressRegion || '';
+                        salary = jobPosting.baseSalary?.value?.value ? `${jobPosting.baseSalary?.value?.value} ${jobPosting.baseSalary?.value?.currency || ''}`.trim() : '';
+                        if (jobPosting.description) {
+                            descriptionHtml = String(jobPosting.description);
+                            descriptionText = cheerioLoad(descriptionHtml)('body').text().replace(/\s+/g, ' ').trim();
+                        }
+                    }
+
+                    if (!title) title = $('h1, [data-test="vacancy-title"], .job-title, .title').first().text().trim();
+                    if (!company) company = $('[data-test="vacancy-company"], .company, .employer, .company-name').first().text().trim();
+                    if (!locationVal) locationVal = $('[data-test="vacancy-location"], .location, .job-location').first().text().trim();
+                    if (!salary) salary = $('[data-test="vacancy-salary"], .salary, .compensation').first().text().trim();
+                    if (!descriptionText) {
+                        const descEl = $('[data-test="vacancy-description"], .job-description, .description, .vacancy-description, .content, main').first();
+                        descriptionHtml = descEl.html() || '';
+                        descriptionText = descEl.text().replace(/\s+/g, ' ').trim();
+                    }
 
                     if (!title) {
                         log.warning(`⚠️ Missing title on ${request.url}`);
@@ -294,7 +357,8 @@ export async function main() {
                         company,
                         location: locationVal,
                         salary,
-                        description: desc,
+                        description_html: descriptionHtml,
+                        description_text: descriptionText,
                         job_url: request.url,
                         source_page: request.userData?.referer,
                     });
@@ -314,11 +378,17 @@ export async function main() {
             },
         });
 
-        const startUrl = new URL(`${BASE_URL}/SearchResult`);
-        startUrl.searchParams.set('ukw', searchQuery);
-        if (location) startUrl.searchParams.set('rgns', location);
+        let startRequests = [];
+        if (Array.isArray(startUrls) && startUrls.length > 0) {
+            startRequests = startUrls.map((u, idx) => ({ url: u, userData: { label: 'SEARCH', page: 1, idx } }));
+        } else {
+            const startUrl = new URL(`${BASE_URL}/SearchResult`);
+            if (searchQuery) startUrl.searchParams.set('ukw', searchQuery);
+            if (location) startUrl.searchParams.set('rgns', location);
+            startRequests = [{ url: startUrl.href, userData: { label: 'SEARCH', page: 1 } }];
+        }
 
-        await crawler.run([{ url: startUrl.href, userData: { label: 'SEARCH', page: 1 } }]);
+        await crawler.run(startRequests);
         log.info(`🎉 Finished — ${saved} job(s) saved.`);
     } catch (err) {
         log.error('❌ Error in main():', err);
