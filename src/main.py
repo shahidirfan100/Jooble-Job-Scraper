@@ -151,6 +151,7 @@ def extract_jobs_from_ld_json(page_soup: BeautifulSoup) -> List[Dict[str, Any]]:
 
 def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
+    # Comprehensive link selectors for Jooble
     link_selectors = [
         'a.job_card_link',
         'a[class*="job_card_link" i]',
@@ -160,8 +161,19 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
         'a[href*="/jd/"]',
         'a[href*="/j/"]',
         'a[href*="redirect?"]',
+        # Additional Jooble patterns
+        'a[href*="/redirect?"]',
+        'a[href*="/search/"]',
+        'a[href*="/vacancy/"]',
+        'a[href*="/position/"]',
+        # Generic job-related links
+        'a[href*="job"]',
+        'a[href*="vacancy"]',
+        'a[href*="position"]',
     ]
     seen_hrefs: Set[str] = set()
+    
+    # First pass: try specific selectors
     for sel in link_selectors:
         for a in page_soup.select(sel):
             href = a.get('href')
@@ -171,6 +183,9 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
             if not abs_url or abs_url in seen_hrefs:
                 continue
             title = a.get_text(strip=True) or None
+            if not title or len(title) < 3:  # Skip very short titles
+                continue
+                
             # Try to find nearby company/location
             parent = a.parent
             company = None
@@ -181,7 +196,7 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
                 if parent:
                     # Look up the tree a few levels for common fields
                     container = parent
-                    for _ in range(3):
+                    for _ in range(4):  # Increased depth
                         if not container:
                             break
                         if not company:
@@ -189,24 +204,31 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
                                 'span[class*="company" i]',
                                 'div[class*="company" i]',
                                 'a[data-qa*="company" i]',
+                                'span[class*="employer" i]',
+                                'div[class*="employer" i]',
                             ])
                         if not location:
                             location = select_first_text(container, [
                                 'span[class*="location" i]',
                                 'div[class*="location" i]',
                                 'span[data-qa*="location" i]',
+                                'span[class*="city" i]',
+                                'div[class*="city" i]',
                             ])
                         if not salary:
                             salary = select_first_text(container, [
                                 'span[class*="salary" i]',
                                 'div[class*="salary" i]',
                                 'span[data-qa*="salary" i]',
+                                'span[class*="wage" i]',
+                                'div[class*="wage" i]',
                             ])
                         if not description_text:
                             desc_html = select_first_html(container, [
                                 'div[class*="description" i]',
                                 'div[class*="desc" i]',
                                 'div[data-qa*="vacancy-snippet" i]',
+                                'div[class*="snippet" i]',
                             ])
                             if desc_html:
                                 description_text = BeautifulSoup(desc_html, 'lxml').get_text(strip=True)
@@ -226,7 +248,128 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
                 'salary': salary,
             })
             seen_hrefs.add(abs_url)
+    
+    # Second pass: scan all links for job-related patterns if we found nothing
+    if not items:
+        Actor.log.info('No specific job links found, scanning all links for job patterns...')
+        for a in page_soup.find_all('a', href=True):
+            href = a.get('href')
+            if not href:
+                continue
+            # Look for job-related patterns in URLs
+            if any(pattern in href.lower() for pattern in ['job', 'vacancy', 'position', 'career', 'employment']):
+                abs_url = absolute_url(page_url, href)
+                if not abs_url or abs_url in seen_hrefs:
+                    continue
+                title = a.get_text(strip=True) or None
+                if not title or len(title) < 3:
+                    continue
+                    
+                items.append({
+                    'job_title': title,
+                    'company': None,
+                    'location': None,
+                    'date_posted': None,
+                    'job_type': None,
+                    'job_url': abs_url,
+                    'description_text': None,
+                    'description_html': None,
+                    'salary': None,
+                })
+                seen_hrefs.add(abs_url)
+    
     return items
+
+
+async def try_ajax_endpoints(session: AsyncHTMLSession, base_url: str, keyword: str, region: str) -> List[Dict[str, Any]]:
+    """Try to find AJAX endpoints that return job data in JSON format."""
+    jobs = []
+    
+    # Common AJAX patterns for job sites
+    ajax_patterns = [
+        f"/api/jobs?keyword={urllib.parse.quote(keyword)}&region={urllib.parse.quote(region)}",
+        f"/api/search?q={urllib.parse.quote(keyword)}&location={urllib.parse.quote(region)}",
+        f"/api/vacancies?search={urllib.parse.quote(keyword)}&location={urllib.parse.quote(region)}",
+        f"/search/jobs?keyword={urllib.parse.quote(keyword)}&region={urllib.parse.quote(region)}",
+        f"/jobs/search?q={urllib.parse.quote(keyword)}&loc={urllib.parse.quote(region)}",
+    ]
+    
+    headers = build_stealth_headers()
+    headers.update({
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': base_url,
+    })
+    
+    for pattern in ajax_patterns:
+        try:
+            ajax_url = urllib.parse.urljoin(base_url, pattern)
+            Actor.log.info(f'Trying AJAX endpoint: {ajax_url}')
+            
+            resp = await session.get(ajax_url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict) and 'jobs' in data:
+                        jobs_data = data['jobs']
+                    elif isinstance(data, list):
+                        jobs_data = data
+                    else:
+                        continue
+                        
+                    for job_data in jobs_data:
+                        if isinstance(job_data, dict):
+                            job_item = {
+                                'job_title': job_data.get('title') or job_data.get('name') or job_data.get('position'),
+                                'company': job_data.get('company') or job_data.get('employer') or job_data.get('organization'),
+                                'location': job_data.get('location') or job_data.get('city') or job_data.get('address'),
+                                'date_posted': job_data.get('datePosted') or job_data.get('created_at') or job_data.get('published'),
+                                'job_type': job_data.get('employmentType') or job_data.get('type') or job_data.get('schedule'),
+                                'job_url': job_data.get('url') or job_data.get('link') or job_data.get('href'),
+                                'description_text': job_data.get('description') or job_data.get('summary'),
+                                'description_html': None,
+                                'salary': job_data.get('salary') or job_data.get('wage') or job_data.get('compensation'),
+                            }
+                            
+                            if job_item['job_title'] or job_item['job_url']:
+                                jobs.append(job_item)
+                                
+                except (ValueError, KeyError) as e:
+                    Actor.log.debug(f'Failed to parse JSON from {ajax_url}: {e}')
+                    continue
+                    
+        except Exception as e:
+            Actor.log.debug(f'AJAX request failed for {pattern}: {e}')
+            continue
+            
+    return jobs
+
+
+def find_pagination_links(page_soup: BeautifulSoup, current_url: str) -> List[str]:
+    """Find pagination links for next pages."""
+    next_links = []
+    
+    # Common pagination selectors
+    pagination_selectors = [
+        'a[aria-label="Next"]',
+        'a[aria-label="next"]',
+        'a.next',
+        'a[class*="next" i]',
+        'a[class*="pagination" i]',
+        'a[href*="p="]',
+        'a[href*="page="]',
+        'a[href*="pagenum="]',
+    ]
+    
+    for selector in pagination_selectors:
+        for link in page_soup.select(selector):
+            href = link.get('href')
+            if href:
+                abs_url = absolute_url(current_url, href)
+                if abs_url and abs_url not in next_links:
+                    next_links.append(abs_url)
+    
+    return next_links
 
 
 def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
@@ -365,13 +508,13 @@ async def fetch_search_page(session: AsyncHTMLSession, url: str, referer: Option
             # If blocked or too small, attempt a lightweight JS render once per attempt
             if not html_text or len(html_text) < 1000 or status in {403, 429}:
                 try:
-                    await resp.html.arender(timeout=25, sleep=random.uniform(0.8, 1.6))
+                    await resp.html.arender(timeout=60, sleep=random.uniform(2, 4))
                     html_text = resp.html.html
                 except Exception as render_err:
                     Actor.log.debug(f'JS render failed on attempt {attempt} for {url}: {render_err}')
 
-            # Basic success heuristic
-            if html_text and ('job' in html_text.lower() or len(html_text) > 2000):
+            # Basic success heuristic - look for job-related content
+            if html_text and ('job' in html_text.lower() or 'redirect?' in html_text or len(html_text) > 2000):
                 return html_text
 
             # Prepare next retry
@@ -433,6 +576,22 @@ async def main() -> None:
         session = AsyncHTMLSession()
 
         try:
+            # First, try AJAX endpoints if we have keyword and region
+            if keyword and not start_url:
+                Actor.log.info('Attempting AJAX endpoint detection...')
+                ajax_jobs = await try_ajax_endpoints(session, 'https://jooble.org', keyword, region)
+                for item in ajax_jobs:
+                    job_url = item.get('job_url')
+                    if job_url and job_url not in seen_urls:
+                        item['source_url'] = 'ajax_endpoint'
+                        item['page_number'] = 0
+                        await Actor.push_data(item)
+                        total_pushed += 1
+                        seen_urls.add(job_url)
+                
+                if ajax_jobs:
+                    Actor.log.info(f'Found {len(ajax_jobs)} jobs via AJAX endpoints')
+
             for page in range(1, max_pages + 1):
                 url = page_url(page)
                 Actor.log.info(f'Scraping search page {page}: {url}')
@@ -506,9 +665,6 @@ async def main() -> None:
                             seen_urls.add(job_url)
                     if new_items_on_page == 0:
                         Actor.log.info('No job blocks, JSON-LD, or anchor-based jobs detected on page, ending.')
-                        break
-                    if new_items_on_page == 0:
-                        Actor.log.info('No job blocks or JSON-LD jobs detected on page, ending.')
                         break
 
                 Actor.log.info(f'Page {page}: pushed {new_items_on_page} new items (total {total_pushed}).')
