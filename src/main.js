@@ -218,45 +218,41 @@ export async function main() {
                     maxUsageCount: 15,
                 },
             },
-            async requestFunction({ request, session, proxyInfo }) {
-                const profile = getSessionProfile(session);
-                const referer = request.userData?.referer || `${BASE_URL}/`;
-                const fetchSite = referer ? 'same-origin' : 'none';
-                const headers = buildHeaders(profile, referer, fetchSite);
+            preNavigationHooks: [
+                async (crawlingContext, goToRequest) => {
+                    const { request, session, proxyInfo } = crawlingContext;
+                    const profile = getSessionProfile(session);
+                    const referer = request.userData?.referer || `${BASE_URL}/`;
+                    const fetchSite = referer ? 'same-origin' : 'none';
+                    const headers = buildHeaders(profile, referer, fetchSite);
 
-                if (session) {
-                    try {
-                        await ensureConsentForSession(session, proxyInfo);
-                    } catch (error) {
-                        log.debug(`Consent fetch failed for session ${session.id}: ${error.message}`);
-                        session.retire();
-                        throw error;
+                    if (session) {
+                        try {
+                            await ensureConsentForSession(session, proxyInfo);
+                        } catch (error) {
+                            log.debug(`Consent fetch failed for session ${session.id}: ${error.message}`);
+                            session.retire();
+                            throw error;
+                        }
+                        const cookieHeader = cookieJarToHeader(session.userData.cookieJar);
+                        if (cookieHeader) headers.Cookie = cookieHeader;
                     }
-                    const cookieHeader = cookieJarToHeader(session.userData.cookieJar);
-                    if (cookieHeader) headers.Cookie = cookieHeader;
-                }
 
-                await sleep(rand(200, 700));
-
-                const response = await gotScraping({
-                    url: request.url,
-                    proxyUrl: proxyInfo?.url,
-                    headers,
-                    http2: true,
-                    throwHttpErrors: false,
-                    timeout: { request: 20000 },
-                });
-
-                if (session && response.headers?.['set-cookie']) {
-                    session.userData.cookieJar = mergeCookies(
-                        session.userData.cookieJar,
-                        parseSetCookieHeaders(response.headers['set-cookie']),
-                    );
-                }
-
-                const contentType = response.headers?.['content-type'];
-                return { body: response.body, statusCode: response.statusCode, headers: response.headers, contentType };
-            },
+                    request.headers = { ...(request.headers || {}), ...headers };
+                    await sleep(rand(200, 700));
+                    await goToRequest();
+                },
+            ],
+            postNavigationHooks: [
+                async ({ session, response }) => {
+                    if (session && response?.headers?.['set-cookie']) {
+                        session.userData.cookieJar = mergeCookies(
+                            session.userData.cookieJar,
+                            parseSetCookieHeaders(response.headers['set-cookie']),
+                        );
+                    }
+                },
+            ],
 
             async requestHandler(context) {
                 const { request, session, enqueueLinks, response, body } = context;
