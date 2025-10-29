@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 import random
 import json
+import re
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from apify import Actor  # pyright: ignore[reportMissingImports]
 from bs4 import BeautifulSoup
-from requests_html import AsyncHTMLSession
+import httpx
 
 # Stealth headers / random user-agents
 try:
@@ -89,6 +90,8 @@ def select_first_html(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional
 
 def extract_jobs_from_ld_json(page_soup: BeautifulSoup) -> List[Dict[str, Any]]:
     jobs: List[Dict[str, Any]] = []
+    
+    # First, try to find JSON-LD structured data
     for script in page_soup.find_all('script', type='application/ld+json'):
         try:
             data = json.loads(script.string or '')
@@ -146,6 +149,61 @@ def extract_jobs_from_ld_json(page_soup: BeautifulSoup) -> List[Dict[str, Any]]:
                     jobs.append(item)
             except Exception:
                 continue
+    
+    # Second, try to extract from inline JavaScript variables (common pattern for SPAs)
+    if not jobs:
+        for script in page_soup.find_all('script'):
+            if not script.string:
+                continue
+            try:
+                script_text = script.string
+                # Look for common JS variable patterns that contain job data
+                # Pattern: var jobs = [...]; or window.__INITIAL_STATE__ = {...};
+                patterns = [
+                    r'var\s+jobs\s*=\s*(\[.*?\]);',
+                    r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
+                    r'window\.__DATA__\s*=\s*(\{.*?\});',
+                    r'"jobs"\s*:\s*(\[.*?\])',
+                    r'"vacancies"\s*:\s*(\[.*?\])',
+                    r'"results"\s*:\s*(\[.*?\])',
+                ]
+                
+                for pattern in patterns:
+                    matches = re.findall(pattern, script_text, re.DOTALL)
+                    for match in matches:
+                        try:
+                            data = json.loads(match)
+                            if isinstance(data, list):
+                                job_list = data
+                            elif isinstance(data, dict):
+                                # Try to find jobs array in the dict
+                                job_list = data.get('jobs') or data.get('vacancies') or data.get('results') or []
+                            else:
+                                continue
+                                
+                            for job_data in job_list:
+                                if not isinstance(job_data, dict):
+                                    continue
+                                item = {
+                                    'job_title': job_data.get('title') or job_data.get('name') or job_data.get('position'),
+                                    'company': job_data.get('company') or job_data.get('employer') or job_data.get('organization'),
+                                    'location': job_data.get('location') or job_data.get('city') or job_data.get('address'),
+                                    'date_posted': job_data.get('datePosted') or job_data.get('created_at') or job_data.get('published'),
+                                    'job_type': job_data.get('employmentType') or job_data.get('type') or job_data.get('schedule'),
+                                    'job_url': job_data.get('url') or job_data.get('link') or job_data.get('href'),
+                                    'description_text': job_data.get('description') or job_data.get('summary'),
+                                    'description_html': None,
+                                    'salary': job_data.get('salary') or job_data.get('wage') or job_data.get('compensation'),
+                                }
+                                if item['job_title'] or item['job_url']:
+                                    jobs.append(item)
+                        except (ValueError, json.JSONDecodeError):
+                            continue
+                            
+            except Exception as e:
+                Actor.log.debug(f'Error extracting from inline JS: {e}')
+                continue
+                
     return jobs
 
 
@@ -285,7 +343,7 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
     return items
 
 
-async def try_ajax_endpoints(session: AsyncHTMLSession, base_url: str, keyword: str, region: str) -> List[Dict[str, Any]]:
+async def try_ajax_endpoints(session: httpx.AsyncClient, base_url: str, keyword: str, region: str) -> List[Dict[str, Any]]:
     """Try to find AJAX endpoints that return job data in JSON format."""
     jobs = []
     
@@ -394,12 +452,29 @@ def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
         # broader anchors possibly wrapped in list containers
         'div[data-qa*="vacancy-item" i]',
         'div[class*="vacancy" i]',
+        # Jooble-specific patterns from actual HTML structure
+        'div[class*="card" i]',
+        'div[class*="listing" i]',
+        'div[class*="item" i]',
+        # Look for divs containing job_card_link anchors
+        'div:has(> a.job_card_link)',
+        'div:has(> a[href*="redirect"])',
+        # More generic container patterns
+        'li',
+        'article',
+        'section > div',
     ]
     for css in strategies:
-        found = page_soup.select(css)
-        if found:
-            candidates.extend(found)
-            Actor.log.debug(f'Strategy "{css}" found {len(found)} elements')
+        try:
+            found = page_soup.select(css)
+            if found:
+                candidates.extend(found)
+                Actor.log.debug(f'Strategy "{css}" found {len(found)} elements')
+        except Exception as e:
+            # Some selectors like :has() might not work in older BeautifulSoup
+            Actor.log.debug(f'Strategy "{css}" failed: {e}')
+            continue
+    
     # De-duplicate while preserving order
     seen: Set[int] = set()
     unique_blocks: List[BeautifulSoup] = []
@@ -494,10 +569,16 @@ def parse_job_block(block: BeautifulSoup, page_url: str) -> Optional[Dict[str, A
     }
 
 
-async def fetch_search_page(session: AsyncHTMLSession, url: str, referer: Optional[str]) -> Optional[str]:
+async def fetch_search_page(session: httpx.AsyncClient, url: str, referer: Optional[str]) -> Optional[str]:
     headers = build_stealth_headers(referer=referer)
     # Add encodings and pragma-like hints often present in real browsers
-    headers.setdefault('Accept-Encoding', 'gzip, deflate, br, zstd')
+    headers.setdefault('Accept-Encoding', 'gzip, deflate, br')
+    
+    # Add cookies that might help get full content
+    cookies = {
+        'lang': 'en',
+        'cookiesAccepted': '1',
+    }
 
     # Simple retry with exponential backoff and jitter
     max_attempts = 3
@@ -507,29 +588,17 @@ async def fetch_search_page(session: AsyncHTMLSession, url: str, referer: Option
             # Randomized small delay before request to reduce burstiness
             await asyncio.sleep(random.uniform(0.4, 1.2))
 
-            resp = await session.get(url, headers=headers, timeout=30)
-            status = getattr(resp, 'status_code', None)
+            resp = await session.get(url, headers=headers, cookies=cookies, timeout=30.0, follow_redirects=True)
+            status = resp.status_code
 
             html_text = resp.text
-            # Always attempt JS render for Jooble (it's heavily JS-dependent)
-            # If blocked or too small, attempt a lightweight JS render once per attempt
-            should_render = (not html_text or len(html_text) < 1000 or status in {403, 429} or 
-                           attempt == 1)  # Always try render on first attempt
             
-            if should_render:
-                try:
-                    Actor.log.info(f'Attempting JS render (attempt {attempt})...')
-                    await resp.html.arender(timeout=60, sleep=random.uniform(2, 4))
-                    html_text = resp.html.html
-                    Actor.log.info(f'JS render completed, HTML length: {len(html_text)} chars')
-                except Exception as render_err:
-                    Actor.log.warning(f'JS render failed on attempt {attempt} for {url}: {render_err}')
-                    # Continue with original HTML if render fails
-                    if not html_text:
-                        html_text = resp.text
-
+            # Log response for debugging
+            if attempt == 1:
+                Actor.log.info(f'Response status: {status}, HTML length: {len(html_text)} chars')
+            
             # Basic success heuristic - look for job-related content
-            if html_text and ('job' in html_text.lower() or 'redirect?' in html_text or len(html_text) > 2000):
+            if html_text and (len(html_text) > 2000):
                 return html_text
 
             # Prepare next retry
@@ -588,9 +657,7 @@ async def main() -> None:
         total_pushed = 0
         referer_url: Optional[str] = None
 
-        session = AsyncHTMLSession()
-
-        try:
+        async with httpx.AsyncClient() as session:
             # First, try AJAX endpoints if we have keyword and region
             if keyword and not start_url:
                 Actor.log.info('Attempting AJAX endpoint detection...')
@@ -711,11 +778,5 @@ async def main() -> None:
                 if new_items_on_page == 0:
                     Actor.log.info('No new items on page; stopping pagination early.')
                     break
-
-        finally:
-            try:
-                await session.close()
-            except Exception:
-                pass
 
         Actor.log.info(f'Scrape complete. Total items: {total_pushed}.')

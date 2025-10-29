@@ -7,14 +7,14 @@ crawlee[beautifulsoup]
 # Ultra-lightweight stealth HTTP scraper
 stealthkit
 
-# HTML parsing for stealthkit or requests-html fallback
+# HTML parsing for stealthkit or httpx fallback
 beautifulsoup4
 
-# Simple JS-rendering (when Cheerio/stealthkit fail, but no heavy browser)
-requests-html
+# Async HTTP client - lightweight, no browser needed
+httpx
 
-# Optional: Fast native HTML parser, recommended for parsing flexibility/speed
+# Fast native HTML parser, recommended for parsing flexibility/speed
 lxml
 
-# Fix ImportError from requests-html: lxml.html.clean split-out
+# Fix ImportError from lxml.html.clean split-out
 lxml_html_clean
