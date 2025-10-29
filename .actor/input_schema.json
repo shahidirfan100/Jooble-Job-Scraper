@@ -1,30 +1,47 @@
 {
-  "title": "Jooble Job Scraper",
-  "description": "Scrape job listings from Jooble.org. Provide either start URLs or a search query. Actor paginates and optionally scrapes detail pages.",
+  "title": "Jooble Job Scraper Input",
+  "description": "Scrape job listings from Jooble.org by providing search keywords and location, or a direct search URL.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "startUrl": {
       "title": "Start URL",
       "type": "string",
-      "description": "Start scraping from a specific Jooble search result URL. If provided, this will override searchQuery.",
+      "description": "Direct Jooble search URL to scrape from. If provided, this overrides keyword and region fields. Example: https://jooble.org/SearchResult?ukw=software+engineer&rgns=New+York",
       "editor": "textfield"
     },
-    "searchQuery": {
-      "title": "Search query (if not using Start URLs)",
+    "keyword": {
+      "title": "Search Keyword",
       "type": "string",
-      "description": "Keyword for job search, e.g., 'admin'. Will be used as the 'ukw' parameter in Jooble search URLs.",
+      "description": "Keyword for job search (e.g., 'software engineer', 'data analyst'). This will be used as the 'ukw' parameter in Jooble search URLs.",
       "editor": "textfield",
-      "prefill": "admin"
+      "prefill": "software engineer"
     },
-    "location": {
-      "title": "Location (if not using Start URLs)",
+    "region": {
+      "title": "Region/Location",
       "type": "string",
-      "description": "Location filter for Jooble search results (leave empty for broader results).",
-      "editor": "textfield"
+      "description": "Location filter for job search (e.g., 'New York', 'London', 'Berlin'). This will be used as the 'rgns' parameter.",
+      "editor": "textfield",
+      "prefill": "New York"
     },
-    "jobAge": {
-      "title": "Job Age Filter",
+    "maxJobs": {
+      "title": "Maximum Jobs",
+      "type": "integer",
+      "description": "Maximum number of jobs to collect. Set to 0 for unlimited (will stop when no more jobs found).",
+      "minimum": 0,
+      "default": 100,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum Pages",
+      "type": "integer",
+      "description": "Maximum number of search result pages to scrape. Each page typically contains multiple job listings.",
+      "minimum": 1,
+      "default": 5,
+      "editor": "number"
+    },
+    "dateFilter": {
+      "title": "Date Filter",
       "type": "string",
       "description": "Filter jobs by posting date.",
       "editor": "select",
@@ -32,41 +49,13 @@
       "enumTitles": ["All time", "Last 24 hours", "Last 7 days", "Last 30 days"],
       "default": "all"
     },
-    "collectDetails": {
-      "title": "Collect job details",
-      "type": "boolean",
-      "description": "If enabled, scraper visits job detail pages to extract full description and JSON-LD.",
-      "editor": "checkbox",
-      "default": true
-    },
-    "maxItems": {
-      "title": "Maximum number of jobs",
-      "type": "integer",
-      "description": "The maximum number of jobs to collect. Default is 100.",
-      "minimum": 1,
-      "default": 100,
-      "editor": "number"
-    },
-     "cookies": {
-      "title": "Custom cookies (raw header)",
-      "type": "string",
-      "description": "Optional raw 'Cookie' header string. Can help bypass consent banners.",
-      "editor": "textfield"
-    },
-    "cookiesJson": {
-      "title": "Custom cookies (JSON)",
-      "type": "string",
-      "description": "Optional JSON-formatted cookies. Accepts an array (e.g., [{\"name\":\"a\",\"value\":\"1\"}]) or an object map (e.g., {\"a\":\"1\"}).",
-      "editor": "textarea"
-    },
     "proxyConfiguration": {
-      "title": "Proxy configuration",
+      "title": "Proxy Configuration",
       "type": "object",
-      "description": "Proxy settings (use Apify Proxy for best results).",
+      "description": "Proxy settings for anti-bot protection. Use Apify Proxy for best results.",
       "editor": "proxy",
       "default": { "useApifyProxy": true }
     }
   },
-  "required": [],
-  "additionalProperties": false
+  "required": []
 }

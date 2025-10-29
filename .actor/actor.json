@@ -1,13 +1,18 @@
 {
-  "actorSpecification": 1,
-  "name": "jooble-job-scraper",
-  "version": "1.0.0",
-  "buildTag": "latest",
-  "dockerfile": "./Dockerfile",
-  "readme": "../README.md",
-  "input": "./input_schema.json",
-  "nodeJsVersion": "22",
-  "storages": {
-    "dataset": "./dataset_schema.json"
-  }
+    "actorSpecification": 1,
+    "name": "jooble-job-scraper",
+    "title": "Jooble Job Scraper",
+    "description": "Scrapes job listings from Jooble.org using keyword and location search parameters. Extracts job titles, companies, locations, salaries, and descriptions.",
+    "version": "1.0.0",
+    "buildTag": "latest",
+    "meta": {
+        "templateId": "python-crawlee-beautifulsoup",
+        "model": "GPT-5"
+    },
+    "input": "./input_schema.json",
+    "output": "./output_schema.json",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    },
+    "dockerfile": "../Dockerfile"
 }

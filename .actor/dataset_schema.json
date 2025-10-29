@@ -6,19 +6,20 @@
       "title": "Overview",
       "transformation": {
         "fields": [
-          "title",
+          "job_title",
           "company",
           "location",
           "salary",
           "job_type",
           "date_posted",
-          "url"
+          "job_url",
+          "description_text"
         ]
       },
       "display": {
         "component": "table",
         "properties": {
-          "title": {
+          "job_title": {
             "label": "Job Title",
             "format": "text"
           },
@@ -42,9 +43,13 @@
             "label": "Posted",
             "format": "text"
           },
-          "url": {
+          "job_url": {
             "label": "URL",
             "format": "link"
+          },
+          "description_text": {
+            "label": "Description",
+            "format": "text"
           }
         }
       }

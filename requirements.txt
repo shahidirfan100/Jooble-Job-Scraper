@@ -1,0 +1,17 @@
+# Apify platform core SDK (required)
+apify < 4.0.0
+
+# Crawlee orchestrator with BeautifulSoup for primary, fast scrapes
+crawlee[beautifulsoup]
+
+# Ultra-lightweight stealth HTTP scraper
+stealthkit
+
+# HTML parsing for stealthkit or requests-html fallback
+beautifulsoup4
+
+# Simple JS-rendering (when Cheerio/stealthkit fail, but no heavy browser)
+requests-html
+
+# Optional: Fast native HTML parser, recommended for parsing flexibility/speed
+lxml
