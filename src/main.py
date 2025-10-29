@@ -27,6 +27,12 @@ except Exception:  # pragma: no cover - fallback if stealthkit not available
     sk_build_headers = None
 
 
+# Optional Chrome TLS impersonation client (stealth TLS/JA3)
+try:
+    from curl_cffi import requests as curl_requests  # type: ignore
+except Exception:  # pragma: no cover - fallback if curl_cffi not available
+    curl_requests = None
+
 def build_stealth_headers(referer: Optional[str] = None) -> Dict[str, str]:
     """Return randomized, browser-like headers using stealthkit if available.
 
@@ -575,7 +581,7 @@ def parse_job_block(block: BeautifulSoup, page_url: str) -> Optional[Dict[str, A
     }
 
 
-async def fetch_search_page(session: httpx.AsyncClient, url: str, referer: Optional[str]) -> Optional[str]:
+async def fetch_search_page(session: httpx.AsyncClient, url: str, referer: Optional[str], effective_proxy: Optional[str]) -> Optional[str]:
     headers = build_stealth_headers(referer=referer)
     
     # Realistic cookies that browsers typically send
@@ -614,14 +620,38 @@ async def fetch_search_page(session: httpx.AsyncClient, url: str, referer: Optio
             if status == 403:
                 Actor.log.warning(f'Got 403 Forbidden on attempt {attempt}. Trying different approach...')
                 
-                # On 403, try adding more browser-like behavior
+                # First, try a curl_cffi Chrome TLS impersonation fetch (sync within thread)
+                if curl_requests is not None:
+                    try:
+                        def do_curl_fetch() -> Optional[str]:
+                            proxies = None
+                            if effective_proxy:
+                                proxies = {"http": effective_proxy, "https": effective_proxy}
+                            r = curl_requests.get(
+                                url,
+                                headers=headers,
+                                cookies=cookies,
+                                impersonate="chrome",
+                                proxies=proxies,
+                                timeout=30,
+                                allow_redirects=True,
+                            )
+                            if r.status_code == 200 and len(r.text) > 1000:
+                                return r.text
+                            return None
+                        alt_html = await asyncio.to_thread(do_curl_fetch)
+                        if alt_html:
+                            Actor.log.info('curl_cffi impersonation succeeded after 403.')
+                            return alt_html
+                    except Exception as e:
+                        Actor.log.debug(f'curl_cffi impersonation failed: {e}')
+
+                # On 403 without success, retry with rotated headers
                 if attempt < max_attempts:
-                    # Try with a different User-Agent on next attempt
                     continue
-                else:
-                    Actor.log.error(f'Still getting 403 after {max_attempts} attempts. Jooble is blocking this request.')
-                    Actor.log.error('SOLUTION: Enable "Apify Proxy" in the Actor input to use residential IPs and bypass anti-bot protection.')
-                    return None
+                Actor.log.error(f'Still getting 403 after {max_attempts} attempts. Jooble is blocking this request.')
+                Actor.log.error('SOLUTION: Use Apify Proxy with residential group (apifyProxyGroups: ["RESIDENTIAL"]) to bypass anti-bot protection.')
+                return None
             
             # Check for successful response with actual content
             if status == 200 and len(html_text) > 5000:
@@ -663,6 +693,7 @@ async def main() -> None:
         # Get proxy configuration
         proxy_config = actor_input.get('proxyConfiguration')
         proxy_url = None
+        effective_proxy: Optional[str] = None
         
         if proxy_config:
             use_apify_proxy = proxy_config.get('useApifyProxy', False)
@@ -695,11 +726,9 @@ async def main() -> None:
                 'ukw': keyword,
                 'p': str(page_number),
             }
+            # Do NOT send empty rgns to avoid anti-bot heuristics; omit when not provided
             if region:
                 params['rgns'] = region
-            else:
-                # Keep param present but empty to mirror provided sample URL
-                params['rgns'] = ''
             return 'https://jooble.org/SearchResult?' + urllib.parse.urlencode(params)
 
         seen_urls: Set[str] = set()
@@ -720,9 +749,11 @@ async def main() -> None:
                 # ProxyConfiguration object - get a new URL for each session
                 proxy_str = await proxy_url.new_url()
                 client_kwargs['proxies'] = proxy_str
+                effective_proxy = proxy_str
                 Actor.log.info(f'Configured session with Apify Proxy')
             elif isinstance(proxy_url, str):
                 client_kwargs['proxies'] = proxy_url
+                effective_proxy = proxy_url
                 Actor.log.info(f'Configured session with custom proxy')
         
         async with httpx.AsyncClient(**client_kwargs) as session:
@@ -746,7 +777,7 @@ async def main() -> None:
                 url = page_url(page)
                 Actor.log.info(f'Scraping search page {page}: {url}')
 
-                html = await fetch_search_page(session, url, referer=referer_url)
+                html = await fetch_search_page(session, url, referer=referer_url, effective_proxy=effective_proxy)
                 referer_url = url
                 if not html:
                     Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')

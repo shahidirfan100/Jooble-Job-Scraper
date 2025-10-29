@@ -13,6 +13,9 @@ beautifulsoup4
 # Async HTTP client - lightweight, no browser needed, with HTTP/2 support
 httpx[http2]
 
+# Chrome TLS/JA3 impersonation to bypass anti-bot 403s
+curl_cffi>=0.6.0
+
 # Fast native HTML parser, recommended for parsing flexibility/speed
 lxml
 
