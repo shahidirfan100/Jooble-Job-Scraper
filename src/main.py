@@ -36,33 +36,39 @@ def build_stealth_headers(referer: Optional[str] = None) -> Dict[str, str]:
         ua = sk_user_agent.random()
         headers = sk_build_headers(user_agent=ua)
     else:
+        # Use latest, most common User-Agents from real browsers
         fallback_uas = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
         ]
         ua = random.choice(fallback_uas)
+        
+        # More realistic header order and values matching real browsers
         headers = {
             'User-Agent': ua,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'Upgrade-Insecure-Requests': '1',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Cache-Control': 'max-age=0',
+            'Sec-Ch-Ua': '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-Site': 'none',
             'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
             'DNT': '1',
-            'Connection': 'keep-alive',
-            # Client hints commonly present
-            'sec-ch-ua': '"Chromium";v="127", "Not)A;Brand";v="24", "Google Chrome";v="127"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
         }
+    
     if referer:
         headers['Referer'] = referer
+        # When we have a referer, it means we're navigating within the site
+        headers['Sec-Fetch-Site'] = 'same-origin'
+    
     return headers
 
 
@@ -571,22 +577,30 @@ def parse_job_block(block: BeautifulSoup, page_url: str) -> Optional[Dict[str, A
 
 async def fetch_search_page(session: httpx.AsyncClient, url: str, referer: Optional[str]) -> Optional[str]:
     headers = build_stealth_headers(referer=referer)
-    # Add encodings and pragma-like hints often present in real browsers
-    headers.setdefault('Accept-Encoding', 'gzip, deflate, br')
     
-    # Add cookies that might help get full content
+    # Realistic cookies that browsers typically send
     cookies = {
-        'lang': 'en',
         'cookiesAccepted': '1',
     }
 
-    # Simple retry with exponential backoff and jitter
-    max_attempts = 3
-    backoff_base = 1.0
+    # Retry with different strategies to avoid 403
+    max_attempts = 5
+    backoff_base = 2.0
+    
     for attempt in range(1, max_attempts + 1):
         try:
-            # Randomized small delay before request to reduce burstiness
-            await asyncio.sleep(random.uniform(0.4, 1.2))
+            # Longer delay on retries to avoid rate limiting
+            if attempt > 1:
+                delay = backoff_base * (2 ** (attempt - 2)) + random.uniform(1.0, 3.0)
+                Actor.log.info(f'Waiting {delay:.1f}s before retry {attempt}...')
+                await asyncio.sleep(delay)
+            else:
+                # Small initial delay to simulate human behavior
+                await asyncio.sleep(random.uniform(1.0, 2.5))
+            
+            # Rotate headers on each retry to avoid fingerprinting
+            if attempt > 1:
+                headers = build_stealth_headers(referer=referer)
 
             resp = await session.get(url, headers=headers, cookies=cookies, timeout=30.0, follow_redirects=True)
             status = resp.status_code
@@ -594,25 +608,42 @@ async def fetch_search_page(session: httpx.AsyncClient, url: str, referer: Optio
             html_text = resp.text
             
             # Log response for debugging
-            if attempt == 1:
-                Actor.log.info(f'Response status: {status}, HTML length: {len(html_text)} chars')
+            Actor.log.info(f'Response status: {status}, HTML length: {len(html_text)} chars')
             
-            # Basic success heuristic - look for job-related content
-            if html_text and (len(html_text) > 2000):
+            # Check if we got blocked
+            if status == 403:
+                Actor.log.warning(f'Got 403 Forbidden on attempt {attempt}. Trying different approach...')
+                
+                # On 403, try adding more browser-like behavior
+                if attempt < max_attempts:
+                    # Try with a different User-Agent on next attempt
+                    continue
+                else:
+                    Actor.log.error(f'Still getting 403 after {max_attempts} attempts. Jooble is blocking this request.')
+                    Actor.log.error('SOLUTION: Enable "Apify Proxy" in the Actor input to use residential IPs and bypass anti-bot protection.')
+                    return None
+            
+            # Check for successful response with actual content
+            if status == 200 and len(html_text) > 5000:
+                # Look for job-related content indicators
+                html_lower = html_text.lower()
+                has_content = any(keyword in html_lower for keyword in ['job', 'vacancy', 'position', 'employment', 'career'])
+                
+                if has_content or len(html_text) > 10000:
+                    return html_text
+                else:
+                    Actor.log.warning(f'Got 200 but HTML seems to be a block page (no job keywords found)')
+                    if attempt < max_attempts:
+                        continue
+                    
+            # Other status codes
+            if status in {200, 301, 302}:
                 return html_text
-
-            # Prepare next retry
-            if attempt < max_attempts:
-                delay = backoff_base * (2 ** (attempt - 1)) + random.uniform(0.2, 0.8)
-                Actor.log.info(f'Weak/blocked response (status={status}) for {url}, retrying in {delay:.1f}s...')
-                await asyncio.sleep(delay)
+                
         except Exception as e:
-            if attempt < max_attempts:
-                delay = backoff_base * (2 ** (attempt - 1)) + random.uniform(0.2, 0.8)
-                Actor.log.info(f'Fetch error on attempt {attempt} for {url}: {e}. Retrying in {delay:.1f}s...')
-                await asyncio.sleep(delay)
-            else:
-                Actor.log.warning(f'Failed to fetch {url}: {e}')
+            Actor.log.warning(f'Fetch error on attempt {attempt} for {url}: {e}')
+            if attempt >= max_attempts:
+                Actor.log.error(f'Failed to fetch {url} after {max_attempts} attempts')
 
     return None
 
@@ -628,6 +659,24 @@ async def main() -> None:
         max_pages: int = int(actor_input.get('max_pages') or 1)
         start_url: Optional[str] = (actor_input.get('startUrl') or '').strip() or None
         max_jobs: int = int(actor_input.get('maxJobs') or 0)
+        
+        # Get proxy configuration
+        proxy_config = actor_input.get('proxyConfiguration')
+        proxy_url = None
+        
+        if proxy_config:
+            use_apify_proxy = proxy_config.get('useApifyProxy', False)
+            if use_apify_proxy:
+                # Get Apify proxy URL from the Actor configuration
+                proxy_url = Actor.create_proxy_configuration(actor_proxy_input=proxy_config)
+                if proxy_url:
+                    Actor.log.info('Using Apify Proxy to avoid IP blocking')
+            elif proxy_config.get('proxyUrls'):
+                # Use custom proxy if provided
+                proxy_urls = proxy_config.get('proxyUrls', [])
+                if proxy_urls:
+                    proxy_url = random.choice(proxy_urls)
+                    Actor.log.info(f'Using custom proxy')
 
         if not start_url and not keyword:
             Actor.log.info('Provide either "startUrl" or "keyword" (ukw). Exiting...')
@@ -657,7 +706,26 @@ async def main() -> None:
         total_pushed = 0
         referer_url: Optional[str] = None
 
-        async with httpx.AsyncClient() as session:
+        # Use HTTP/2 to better mimic modern browsers, with realistic timeout settings
+        # Configure proxy if provided
+        client_kwargs = {
+            'http2': True,
+            'timeout': 30.0,
+            'follow_redirects': True,
+        }
+        
+        if proxy_url:
+            # For Apify proxy, we need to get the actual proxy URL string
+            if hasattr(proxy_url, 'new_url'):
+                # ProxyConfiguration object - get a new URL for each session
+                proxy_str = await proxy_url.new_url()
+                client_kwargs['proxies'] = proxy_str
+                Actor.log.info(f'Configured session with Apify Proxy')
+            elif isinstance(proxy_url, str):
+                client_kwargs['proxies'] = proxy_url
+                Actor.log.info(f'Configured session with custom proxy')
+        
+        async with httpx.AsyncClient(**client_kwargs) as session:
             # First, try AJAX endpoints if we have keyword and region
             if keyword and not start_url:
                 Actor.log.info('Attempting AJAX endpoint detection...')
