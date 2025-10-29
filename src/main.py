@@ -149,6 +149,86 @@ def extract_jobs_from_ld_json(page_soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return jobs
 
 
+def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    link_selectors = [
+        'a.job_card_link',
+        'a[class*="job_card_link" i]',
+        'a._8w9Ce2.tUC4Fj._6i4Nb0.wtCvxI.job_card_link',
+        'a[href*="/job/"]',
+        'a[href*="/jdp/"]',
+        'a[href*="/jd/"]',
+        'a[href*="/j/"]',
+        'a[href*="redirect?"]',
+    ]
+    seen_hrefs: Set[str] = set()
+    for sel in link_selectors:
+        for a in page_soup.select(sel):
+            href = a.get('href')
+            if not href:
+                continue
+            abs_url = absolute_url(page_url, href)
+            if not abs_url or abs_url in seen_hrefs:
+                continue
+            title = a.get_text(strip=True) or None
+            # Try to find nearby company/location
+            parent = a.parent
+            company = None
+            location = None
+            salary = None
+            description_text = None
+            try:
+                if parent:
+                    # Look up the tree a few levels for common fields
+                    container = parent
+                    for _ in range(3):
+                        if not container:
+                            break
+                        if not company:
+                            company = select_first_text(container, [
+                                'span[class*="company" i]',
+                                'div[class*="company" i]',
+                                'a[data-qa*="company" i]',
+                            ])
+                        if not location:
+                            location = select_first_text(container, [
+                                'span[class*="location" i]',
+                                'div[class*="location" i]',
+                                'span[data-qa*="location" i]',
+                            ])
+                        if not salary:
+                            salary = select_first_text(container, [
+                                'span[class*="salary" i]',
+                                'div[class*="salary" i]',
+                                'span[data-qa*="salary" i]',
+                            ])
+                        if not description_text:
+                            desc_html = select_first_html(container, [
+                                'div[class*="description" i]',
+                                'div[class*="desc" i]',
+                                'div[data-qa*="vacancy-snippet" i]',
+                            ])
+                            if desc_html:
+                                description_text = BeautifulSoup(desc_html, 'lxml').get_text(strip=True)
+                        container = container.parent
+            except Exception:
+                pass
+
+            items.append({
+                'job_title': title,
+                'company': company,
+                'location': location,
+                'date_posted': None,
+                'job_type': None,
+                'job_url': abs_url,
+                'description_text': description_text,
+                'description_html': None,
+                'salary': salary,
+            })
+            seen_hrefs.add(abs_url)
+    return items
+
+
 def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
     """Try multiple strategies to identify job listing blocks on Jooble search pages."""
     candidates = []
@@ -408,6 +488,25 @@ async def main() -> None:
                         new_items_on_page += 1
                         if job_url:
                             seen_urls.add(job_url)
+                        collected_any = True
+
+                if not collected_any:
+                    # As a last resort, scan anchors directly for job links
+                    link_jobs = extract_jobs_from_links(soup, page_url=url)
+                    for item in link_jobs:
+                        job_url = item.get('job_url')
+                        if job_url and job_url in seen_urls:
+                            continue
+                        item['source_url'] = url
+                        item['page_number'] = page
+                        await Actor.push_data(item)
+                        total_pushed += 1
+                        new_items_on_page += 1
+                        if job_url:
+                            seen_urls.add(job_url)
+                    if new_items_on_page == 0:
+                        Actor.log.info('No job blocks, JSON-LD, or anchor-based jobs detected on page, ending.')
+                        break
                     if new_items_on_page == 0:
                         Actor.log.info('No job blocks or JSON-LD jobs detected on page, ending.')
                         break
