@@ -151,6 +151,28 @@ function extractDetailLinks($, base = BASE_URL) {
 function rand(min, max) { return Math.random() * (max - min) + min; }
 async function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
+function isPlainObject(obj) {
+    return obj && typeof obj === 'object' && !Array.isArray(obj);
+}
+
+function sanitizeProxyConfiguration(inputProxyConfiguration) {
+    if (!isPlainObject(inputProxyConfiguration)) return null;
+    const allowedKeys = new Set([
+        'useApifyProxy', 'apifyProxyGroups', 'apifyProxyCountry', 'password', 'newUrlFunction',
+        'hostname', 'port', 'username', 'endpoint', 'groups', 'country',
+    ]);
+    const out = {};
+    for (const [k, v] of Object.entries(inputProxyConfiguration)) {
+        if (!allowedKeys.has(k)) continue;
+        out[k] = v;
+    }
+    // Basic normalization of legacy aliases
+    if (Array.isArray(out.groups) && !out.apifyProxyGroups) out.apifyProxyGroups = out.groups;
+    if (typeof out.country === 'string' && !out.apifyProxyCountry) out.apifyProxyCountry = out.country;
+    if (typeof out.useApifyProxy !== 'boolean' && (out.apifyProxyGroups || out.apifyProxyCountry)) out.useApifyProxy = true;
+    return Object.keys(out).length ? out : null;
+}
+
 // ───────────────────────────────────────────────────────────────
 // Main
 // ───────────────────────────────────────────────────────────────
@@ -172,11 +194,16 @@ export async function main() {
             proxyConfiguration: inputProxyConfiguration,
         } = input;
 
-        const proxyConfiguration = await Actor.createProxyConfiguration(
-            inputProxyConfiguration && Object.keys(inputProxyConfiguration).length
-                ? inputProxyConfiguration
-                : { useApifyProxy: true }
-        );
+        let proxyConfiguration;
+        try {
+            const sanitized = sanitizeProxyConfiguration(inputProxyConfiguration);
+            proxyConfiguration = await Actor.createProxyConfiguration(
+                sanitized || { useApifyProxy: true }
+            );
+        } catch (e) {
+            log.warning(`Proxy configuration invalid, falling back to direct connection: ${e?.message || e}`);
+            proxyConfiguration = await Actor.createProxyConfiguration({ useApifyProxy: false });
+        }
 
         const crawler = new CheerioCrawler({
             proxyConfiguration,
@@ -380,7 +407,8 @@ export async function main() {
 
         let startRequests = [];
         if (Array.isArray(startUrls) && startUrls.length > 0) {
-            startRequests = startUrls.map((u, idx) => ({ url: u, userData: { label: 'SEARCH', page: 1, idx } }));
+            const validUrls = startUrls.filter((u) => typeof u === 'string' && u.trim());
+            startRequests = validUrls.map((u, idx) => ({ url: u, userData: { label: 'SEARCH', page: 1, idx } }));
         } else {
             const startUrl = new URL(`${BASE_URL}/SearchResult`);
             if (searchQuery) startUrl.searchParams.set('ukw', searchQuery);
@@ -391,7 +419,10 @@ export async function main() {
         await crawler.run(startRequests);
         log.info(`🎉 Finished — ${saved} job(s) saved.`);
     } catch (err) {
-        log.error('❌ Error in main():', err);
+        const message = err?.message || String(err);
+        const stack = err?.stack || '';
+        log.error(`❌ Error in main(): ${message}`);
+        if (stack) log.error(stack);
         throw err;
     } finally {
         await Actor.exit();
