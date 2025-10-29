@@ -15,3 +15,6 @@ requests-html
 
 # Optional: Fast native HTML parser, recommended for parsing flexibility/speed
 lxml
+
+# Fix ImportError from requests-html: lxml.html.clean split-out
+lxml_html_clean
