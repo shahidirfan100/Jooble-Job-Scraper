@@ -49,12 +49,14 @@ function buildHeaders(profile, referer, fetchSite) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': fetchSite,
         'Sec-Fetch-User': '?1',
+        'Priority': 'u=0, i',
         'Upgrade-Insecure-Requests': '1',
         ...(profile.ch || {}),
     };
@@ -106,27 +108,39 @@ async function ensureConsentForSession(session, proxyInfo) {
 
     const profile = getSessionProfile(session);
     const headers = buildHeaders(profile, undefined, 'none');
-    const response = await gotScraping({
-        url: BASE_URL,
-        proxyUrl: proxyInfo?.url,
-        headers,
-        http2: true,
-        throwHttpErrors: false,
-        timeout: { request: 15000 },
-    });
+    const endpoints = [
+        `${BASE_URL}/robots.txt`,
+        `${BASE_URL}/`,
+    ];
 
-    if (response.statusCode >= 400) {
-        throw new Error(`Consent fetch failed with status ${response.statusCode}`);
+    for (let i = 0; i < endpoints.length; i++) {
+        try {
+            const response = await gotScraping({
+                url: endpoints[i],
+                proxyUrl: proxyInfo?.url,
+                headers,
+                http2: i === 0, // try http2 first on robots, then fallback to http1
+                throwHttpErrors: false,
+                timeout: { request: 15000 },
+            });
+
+            if (response.statusCode >= 400) {
+                continue;
+            }
+
+            await sleep(rand(200, 500));
+            const updates = parseSetCookieHeaders(response.headers?.['set-cookie']);
+            if (Object.keys(updates).length > 0) {
+                session.userData.cookieJar = mergeCookies(session.userData.cookieJar, updates);
+                return cookieJarToHeader(session.userData.cookieJar);
+            }
+        } catch {
+            // ignore and try next endpoint
+        }
     }
 
-    await sleep(rand(200, 500));
-
-    const updates = parseSetCookieHeaders(response.headers?.['set-cookie']);
-    if (Object.keys(updates).length === 0) {
-        throw new Error('Consent cookies missing in response');
-    }
-    session.userData.cookieJar = mergeCookies(session.userData.cookieJar, updates);
-    return cookieJarToHeader(session.userData.cookieJar);
+    // Could not obtain consent cookies; return empty and let caller handle with retries/backoff
+    return '';
 }
 
 function isCookieOrBotWall(html) {
@@ -227,15 +241,11 @@ export async function main() {
                     const headers = buildHeaders(profile, referer, fetchSite);
 
                     if (session) {
-                        try {
-                            await ensureConsentForSession(session, proxyInfo);
-                        } catch (error) {
-                            log.debug(`Consent fetch failed for session ${session.id}: ${error.message}`);
-                            session.retire();
-                            throw error;
-                        }
-                        const cookieHeader = cookieJarToHeader(session.userData.cookieJar);
-                        if (cookieHeader) headers.Cookie = cookieHeader;
+                        const cookieHeaderBefore = cookieJarToHeader(session.userData.cookieJar);
+                        if (cookieHeaderBefore) headers.Cookie = cookieHeaderBefore;
+                        const consentCookieHeader = await ensureConsentForSession(session, proxyInfo);
+                        if (consentCookieHeader) headers.Cookie = consentCookieHeader;
+                        else session.markBad();
                     }
 
                     request.headers = { ...(request.headers || {}), ...headers };
