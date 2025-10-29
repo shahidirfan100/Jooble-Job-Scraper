@@ -277,7 +277,11 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
                     'salary': None,
                 })
                 seen_hrefs.add(abs_url)
+                # Log first few found links for debugging
+                if len(items) <= 5:
+                    Actor.log.info(f'Found link via pattern scan: {title[:50]} -> {abs_url[:100]}')
     
+    Actor.log.info(f'extract_jobs_from_links found {len(items)} items total')
     return items
 
 
@@ -395,6 +399,7 @@ def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
         found = page_soup.select(css)
         if found:
             candidates.extend(found)
+            Actor.log.debug(f'Strategy "{css}" found {len(found)} elements')
     # De-duplicate while preserving order
     seen: Set[int] = set()
     unique_blocks: List[BeautifulSoup] = []
@@ -403,6 +408,7 @@ def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
         if key not in seen:
             seen.add(key)
             unique_blocks.append(block)
+    Actor.log.info(f'extract_job_blocks found {len(unique_blocks)} unique blocks')
     return unique_blocks
 
 
@@ -505,13 +511,22 @@ async def fetch_search_page(session: AsyncHTMLSession, url: str, referer: Option
             status = getattr(resp, 'status_code', None)
 
             html_text = resp.text
+            # Always attempt JS render for Jooble (it's heavily JS-dependent)
             # If blocked or too small, attempt a lightweight JS render once per attempt
-            if not html_text or len(html_text) < 1000 or status in {403, 429}:
+            should_render = (not html_text or len(html_text) < 1000 or status in {403, 429} or 
+                           attempt == 1)  # Always try render on first attempt
+            
+            if should_render:
                 try:
+                    Actor.log.info(f'Attempting JS render (attempt {attempt})...')
                     await resp.html.arender(timeout=60, sleep=random.uniform(2, 4))
                     html_text = resp.html.html
+                    Actor.log.info(f'JS render completed, HTML length: {len(html_text)} chars')
                 except Exception as render_err:
-                    Actor.log.debug(f'JS render failed on attempt {attempt} for {url}: {render_err}')
+                    Actor.log.warning(f'JS render failed on attempt {attempt} for {url}: {render_err}')
+                    # Continue with original HTML if render fails
+                    if not html_text:
+                        html_text = resp.text
 
             # Basic success heuristic - look for job-related content
             if html_text and ('job' in html_text.lower() or 'redirect?' in html_text or len(html_text) > 2000):
@@ -602,15 +617,35 @@ async def main() -> None:
                     Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')
                     break
 
+                # Debug: Log HTML stats
+                Actor.log.info(f'HTML length: {len(html)} chars')
+                html_lower = html.lower()
+                has_job = 'job' in html_lower
+                has_redirect = 'redirect' in html_lower
+                has_vacancy = 'vacancy' in html_lower
+                has_position = 'position' in html_lower
+                Actor.log.info(f'HTML contains: job={has_job}, redirect={has_redirect}, vacancy={has_vacancy}, position={has_position}')
+                
+                # Save HTML sample for debugging (first page only)
+                if page == 1:
+                    try:
+                        await Actor.set_value('debug_html_sample', html[:50000], content_type='text/html')
+                        Actor.log.info('Saved HTML sample to key-value store (debug_html_sample)')
+                    except Exception as e:
+                        Actor.log.debug(f'Failed to save HTML sample: {e}')
+
                 soup = BeautifulSoup(html, 'lxml')
+                
+                # Debug: Count all links
+                all_links = soup.find_all('a', href=True)
+                Actor.log.info(f'Found {len(all_links)} total links on page')
+                redirect_links = [a for a in all_links if 'redirect' in a.get('href', '').lower()]
+                job_links = [a for a in all_links if any(p in a.get('href', '').lower() for p in ['job', 'vacancy', 'position'])]
+                Actor.log.info(f'Found {len(redirect_links)} redirect links, {len(job_links)} job-related links')
                 blocks = extract_job_blocks(soup)
                 if not blocks:
-                    # As a secondary check, attempt render again if not already
-                    Actor.log.info('No job blocks found; attempting JS render fallback...')
-                    html2 = await fetch_search_page(session, url, referer=referer_url)
-                    if html2:
-                        soup = BeautifulSoup(html2, 'lxml')
-                        blocks = extract_job_blocks(soup)
+                    # Log what we found for debugging
+                    Actor.log.warning(f'No job blocks found. Total links: {len(all_links)}, Redirect links: {len(redirect_links)}, Job links: {len(job_links)}')
 
                 collected_any = False
 
