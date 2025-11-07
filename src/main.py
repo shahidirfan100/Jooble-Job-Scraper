@@ -8,197 +8,325 @@ and `rgns` (region), paginates via `p` parameter, and outputs structured dataset
 import asyncio
 import random
 import urllib.parse
-def get_random_user_agent():
-    # TODO: Implement random user agent selection
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
 import re
 import json
 from typing import List, Dict, Any, Set, Optional
-from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup, Tag
 from playwright.async_api import async_playwright, Page
-# Helper stubs and missing imports
-def absolute_url(base: str, href: str) -> str:
-    # TODO: Implement absolute URL resolution
-    return href
+from apify import Actor
 
-def select_first_text(container, selectors):
-    # TODO: Implement text selection from container
-    return None
+# --- Helper Functions ---
 
-def select_first_html(container, selectors):
-    # TODO: Implement HTML selection from container
-    return None
-
-# Dummy Actor stub for logging
-class Actor:
-    class log:
-        @staticmethod
-        def debug(msg):
-            print(msg)
-        @staticmethod
-        def info(msg):
-            print(msg)
-        @staticmethod
-        def warning(msg):
-            print(msg)
-        @staticmethod
-        def error(msg):
-            print(msg)
-# If using Apify Actor, import Actor as needed
-
-async def main():
-    return []
-
-
-def parse_job_block(block: BeautifulSoup, page_url: str):
-    # TODO: Implement job block parsing logic
-    return {}
-
-
-def extract_jobs_from_links(soup: BeautifulSoup, page_url: str):
-    # TODO: Implement anchor-based job extraction logic
-    return []
-
-def extract_jobs_from_ld_json(soup: BeautifulSoup) -> list:
-    # TODO: Implement JSON-LD job extraction logic
-    return []
-
-def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
-    """Try multiple strategies to identify job listing blocks on Jooble search pages."""
-    candidates = []
-    # Common structures observed across locales; keep broad fallbacks
-    strategies = [
-        'article',
-        'div[data-test="job"]',
-        'div[class*="job" i]',
-        'div[class*="result" i]',
-        'li[class*="job" i]',
-        'li[class*="result" i]',
-        'article[class*="job" i]',
-        'div[id^="job_" i]',
-        'section[role="main"] article',
-        'div[data-qa*="vacancy" i]',
-        # broader anchors possibly wrapped in list containers
-        'div[data-qa*="vacancy-item" i]',
-        'div[class*="vacancy" i]',
-        # Jooble-specific patterns from actual HTML structure
-        'div[class*="card" i]',
-        'div[class*="listing" i]',
-        'div[class*="item" i]',
-        # Look for divs containing job_card_link anchors
-        'div:has(> a.job_card_link)',
-        'div:has(> a[href*="redirect"])',
-        # More generic container patterns
-        'li',
-        'article',
-        'section > div',
+def get_random_user_agent():
+    """Return a random realistic user agent."""
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     ]
-    for css in strategies:
+    return random.choice(user_agents)
+
+
+def absolute_url(base: str, href: str) -> str:
+    """Convert relative URL to absolute."""
+    if not href:
+        return ''
+    return urljoin(base, href)
+
+
+def select_first_text(container: Tag, selectors: List[str]) -> Optional[str]:
+    """Try multiple selectors and return first non-empty text."""
+    if not container:
+        return None
+    for selector in selectors:
         try:
-            found = page_soup.select(css)
-            if found:
-                candidates.extend(found)
-                Actor.log.debug(f'Strategy "{css}" found {len(found)} elements')
-        except Exception as e:
-            # Some selectors like :has() might not work in older BeautifulSoup
-            Actor.log.debug(f'Strategy "{css}" failed: {e}')
+            elem = container.select_one(selector)
+            if elem:
+                text = elem.get_text(strip=True)
+                if text:
+                    return text
+        except Exception:
+            continue
+    return None
+
+
+def select_first_html(container: Tag, selectors: List[str]) -> Optional[str]:
+    """Try multiple selectors and return first non-empty HTML."""
+    if not container:
+        return None
+    for selector in selectors:
+        try:
+            elem = container.select_one(selector)
+            if elem:
+                html = str(elem)
+                if html:
+                    return html
+        except Exception:
+            continue
+    return None
+
+
+# --- Job Extraction Functions ---
+
+def extract_jobs_from_ld_json(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """Extract jobs from JSON-LD structured data in script tags."""
+    jobs = []
+    
+    # Find all script tags
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string)
+            
+            # Handle single JobPosting
+            if isinstance(data, dict) and data.get('@type') == 'JobPosting':
+                job = parse_json_ld_job(data)
+                if job:
+                    jobs.append(job)
+            
+            # Handle array of JobPostings
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get('@type') == 'JobPosting':
+                        job = parse_json_ld_job(item)
+                        if job:
+                            jobs.append(job)
+        except (json.JSONDecodeError, Exception) as e:
+            Actor.log.debug(f'Error parsing JSON-LD: {e}')
             continue
     
-    # De-duplicate while preserving order
-    seen: Set[int] = set()
-    unique_blocks: List[BeautifulSoup] = []
-    for block in candidates:
-        key = id(block)
-        if key not in seen:
-            seen.add(key)
-            unique_blocks.append(block)
-    Actor.log.info(f'extract_job_blocks found {len(unique_blocks)} unique blocks')
-    return unique_blocks
+    return jobs
 
 
-def parse_job_block(block: BeautifulSoup, page_url: str) -> Optional[Dict[str, Any]]:
-    """Parse a single job block and return a structured dict or None if incomplete."""
-    # Title and URL
-    title_el = block.select_one('div[class*="position" i], a[href*="/job/"]')
-    if not title_el:
-        # Sometimes title anchor is nested
-        title_el = block.select_one('a[href*="/job/"]')
-    if not title_el:
-        # Additional Jooble variants, including obfuscated multi-class link
-        title_el = block.select_one(
-            'a.job_card_link, '
-            'a[class*="job_card_link" i], '
-            'a._8w9Ce2.tUC4Fj._6i4Nb0.wtCvxI.job_card_link, '
-            'a[data-qa*="vacancy-title" i], '
-            'h2 a, h3 a, '
-            'a[href*="/jdp/"], a[href*="/jd/"], a[href*="/j/"], a[href*="redirect?"]'
-        )
-
-    job_title = title_el.get_text(strip=True) if title_el else None
-    href = title_el.get('href') if title_el else None
-    job_url = absolute_url(page_url, href)
-
-    # Company, location, date, salary
-    company = select_first_text(block, [
-        'span[class*="company-name" i]',
-        'div[data-test="company_name"]',
-        'div[class*="company" i]',
-        'a[data-qa*="vacancy-company-name" i]',
-        'span[data-qa*="company" i]',
-    ])
-    location = select_first_text(block, [
-        'span[class*="location" i]',
-        'div[class*="location" i]',
-        'span[data-qa*="location" i]',
-    ])
-    date_posted = select_first_text(block, [
-        'span[class*="date" i]',
-        'time',
-    ])
-    salary = select_first_text(block, [
-        'div[class*="salary" i]',
-        'span[class*="salary" i]',
-        'span[data-qa*="salary" i]',
-    ])
-
-    # Description text/html
-    description_html = select_first_html(block, [
-        'div[class*="description" i]',
-        'div[class*="desc" i]',
-        'div[data-qa*="vacancy-snippet" i]',
-    ])
-    description_text = None
-    if description_html:
-        # Parse again to clean text
-        description_text = BeautifulSoup(description_html, 'html.parser').get_text(strip=True)
-
-    # Job type heuristic: look for tags inside description or chips
-    job_type = select_first_text(block, [
-        'div[class*="description" i] span[class*="type" i]',
-        'span[class*="type" i]',
-        'a[class*="tag" i]',
-        'span[class*="tag" i]',
-        'span[data-qa*="employment" i]',
-        'span[data-qa*="schedule" i]',
-    ])
-
-    if not job_title and not job_url:
+def parse_json_ld_job(data: dict) -> Optional[Dict[str, Any]]:
+    """Parse a single JobPosting JSON-LD object."""
+    try:
+        # Extract location
+        location = None
+        if 'jobLocation' in data:
+            loc = data['jobLocation']
+            if isinstance(loc, dict):
+                address = loc.get('address', {})
+                if isinstance(address, dict):
+                    location = address.get('addressLocality') or address.get('addressRegion')
+        
+        # Extract hiring organization
+        company = None
+        if 'hiringOrganization' in data:
+            org = data['hiringOrganization']
+            if isinstance(org, dict):
+                company = org.get('name')
+        
+        # Extract salary
+        salary = None
+        if 'baseSalary' in data:
+            sal = data['baseSalary']
+            if isinstance(sal, dict):
+                value = sal.get('value', {})
+                if isinstance(value, dict):
+                    min_val = value.get('minValue')
+                    max_val = value.get('maxValue')
+                    currency = sal.get('currency')
+                    if min_val and max_val:
+                        salary = f"{min_val}-{max_val} {currency}"
+                    elif min_val:
+                        salary = f"{min_val} {currency}"
+        
+        return {
+            'job_title': data.get('title'),
+            'company': company,
+            'location': location,
+            'date_posted': data.get('datePosted'),
+            'job_type': data.get('employmentType'),
+            'job_url': data.get('url'),
+            'description_text': data.get('description'),
+            'description_html': None,
+            'salary': salary,
+        }
+    except Exception as e:
+        Actor.log.debug(f'Error parsing JSON-LD job: {e}')
         return None
 
-    return {
-        'job_title': job_title,
-        'company': company,
-        'location': location,
-        'date_posted': date_posted,
-        'job_type': job_type,
-        'job_url': job_url,
-        'description_text': description_text,
-        'description_html': description_html,
-        'salary': salary,
-    }
+
+def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str, Any]]:
+    """Extract jobs by finding job links directly (fallback method)."""
+    jobs = []
+    seen_urls = set()
+    
+    # Jooble uses specific link patterns
+    link_selectors = [
+        'a.job_card_link',
+        'a[href*="/redirect?"]',
+        'a[href*="/job/"]',
+        'a[href*="/jdp/"]',
+    ]
+    
+    for selector in link_selectors:
+        for link in soup.select(selector):
+            href = link.get('href')
+            if not href:
+                continue
+            
+            abs_url = absolute_url(page_url, href)
+            if abs_url in seen_urls:
+                continue
+            seen_urls.add(abs_url)
+            
+            # Get title from link text
+            title = link.get_text(strip=True)
+            if not title or len(title) < 3:
+                continue
+            
+            # Try to find additional info from parent container
+            parent = link.find_parent(['div', 'article', 'li'])
+            company = None
+            location = None
+            salary = None
+            
+            if parent:
+                company = select_first_text(parent, [
+                    'span[class*="company" i]',
+                    'div[class*="company" i]',
+                ])
+                location = select_first_text(parent, [
+                    'span[class*="location" i]',
+                    'div[class*="location" i]',
+                ])
+                salary = select_first_text(parent, [
+                    'span[class*="salary" i]',
+                    'div[class*="salary" i]',
+                ])
+            
+            jobs.append({
+                'job_title': title,
+                'company': company,
+                'location': location,
+                'date_posted': None,
+                'job_type': None,
+                'job_url': abs_url,
+                'description_text': None,
+                'description_html': None,
+                'salary': salary,
+            })
+    
+    return jobs
 
 
-async def fetch_search_page(page: Page, url: str, referer: Optional[str]) -> Optional[str]:
+def extract_job_blocks(page_soup: BeautifulSoup) -> List[Tag]:
+    """Extract job listing blocks from Jooble search page."""
+    blocks = []
+    
+    # Jooble-specific selectors based on actual site structure
+    selectors = [
+        'article',  # Most common container
+        'div[class*="_75cac"]',  # Jooble class pattern
+        'div[data-test-name="job-item"]',
+        'div.job-item',
+    ]
+    
+    for selector in selectors:
+        try:
+            found = page_soup.select(selector)
+            if found:
+                for elem in found:
+                    # Verify it has a job link
+                    link = elem.find('a', href=True)
+                    if link:
+                        href = link.get('href', '')
+                        if any(pattern in href for pattern in ['/redirect', '/job/', '/jdp/']):
+                            blocks.append(elem)
+                
+                if blocks:
+                    Actor.log.debug(f'Selector "{selector}" found {len(blocks)} job blocks')
+                    break
+        except Exception as e:
+            Actor.log.debug(f'Selector "{selector}" failed: {e}')
+            continue
+    
+    return blocks
+
+
+def parse_job_block(block: Tag, page_url: str) -> Optional[Dict[str, Any]]:
+    """Parse a single job block and return structured job data."""
+    try:
+        # Find job link - Jooble uses specific patterns
+        link = block.find('a', href=True)
+        if not link:
+            return None
+        
+        href = link.get('href')
+        if not href or not any(p in href for p in ['/redirect', '/job/', '/jdp/']):
+            return None
+        
+        job_url = absolute_url(page_url, href)
+        job_title = link.get_text(strip=True)
+        
+        if not job_title:
+            return None
+        
+        # Extract company - look for common patterns
+        company = select_first_text(block, [
+            'span[class*="company" i]',
+            'div[class*="company" i]',
+            'a[class*="company" i]',
+            '[data-company]',
+        ])
+        
+        # Extract location
+        location = select_first_text(block, [
+            'span[class*="location" i]',
+            'div[class*="location" i]',
+            '[class*="city" i]',
+            '[data-location]',
+        ])
+        
+        # Extract salary
+        salary = select_first_text(block, [
+            'span[class*="salary" i]',
+            'div[class*="salary" i]',
+            '[class*="wage" i]',
+            '[data-salary]',
+        ])
+        
+        # Extract description snippet
+        description_text = select_first_text(block, [
+            'div[class*="description" i]',
+            'div[class*="snippet" i]',
+            'p[class*="description" i]',
+        ])
+        
+        # Extract date posted
+        date_posted = select_first_text(block, [
+            'span[class*="date" i]',
+            'time',
+            '[datetime]',
+        ])
+        
+        # Extract job type
+        job_type = select_first_text(block, [
+            'span[class*="type" i]',
+            'span[class*="schedule" i]',
+            '[data-type]',
+        ])
+        
+        return {
+            'job_title': job_title,
+            'company': company,
+            'location': location,
+            'date_posted': date_posted,
+            'job_type': job_type,
+            'job_url': job_url,
+            'description_text': description_text,
+            'description_html': None,
+            'salary': salary,
+        }
+    except Exception as e:
+        Actor.log.debug(f'Error parsing job block: {e}')
+        return None
+
+
+async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None) -> Optional[str]:
     """Fetch the HTML content of a search page using Playwright with stealth measures."""
     
     # Set referer if provided
@@ -206,29 +334,53 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str]) -> Opt
         await page.set_extra_http_headers({'Referer': referer})
     
     # Add random delay to mimic human behavior
-    await asyncio.sleep(random.uniform(1.0, 3.0))
+    await asyncio.sleep(random.uniform(1.5, 3.5))
     
     try:
-        # Navigate to the page
-        response = await page.goto(url, wait_until='networkidle', timeout=30000)
+        # Navigate to the page with realistic timeout
+        response = await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+        if not response:
+            Actor.log.error(f'No response from {url}')
+            return None
+            
         if response.status >= 400:
             Actor.log.warning(f'HTTP {response.status} for {url}')
             return None
         
-        # Wait a bit for dynamic content
-        await asyncio.sleep(random.uniform(2.0, 5.0))
+        # Wait for content to load - Jooble uses dynamic rendering
+        try:
+            # Wait for job listings to appear
+            await page.wait_for_selector('article, a[href*="/redirect"], div[class*="job"]', timeout=15000)
+        except Exception as e:
+            Actor.log.debug(f'Timeout waiting for job listings: {e}')
         
-        # Simulate human-like scrolling
+        # Additional wait for dynamic content
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+        
+        # Simulate human-like scrolling behavior
         await page.evaluate("""
-            window.scrollTo({
-                top: Math.floor(Math.random() * 500) + 100,
-                behavior: 'smooth'
-            });
+            async () => {
+                // Smooth scroll down
+                await new Promise(resolve => {
+                    let totalHeight = 0;
+                    const distance = Math.floor(Math.random() * 200) + 100;
+                    const timer = setInterval(() => {
+                        const scrollHeight = document.documentElement.scrollHeight;
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+                        if(totalHeight >= scrollHeight / 2){
+                            clearInterval(timer);
+                            resolve();
+                        }
+                    }, 100);
+                });
+            }
         """)
         await asyncio.sleep(random.uniform(1.0, 2.0))
         
         # Get the HTML content
         html = await page.content()
+        Actor.log.info(f'Successfully fetched page: {len(html)} chars')
         return html
     
     except Exception as e:
@@ -323,15 +475,49 @@ async def main() -> None:
             
             browser = await p.chromium.launch(**launch_options)
             
-            # Create browser context with stealth
+            # Create browser context with stealth and realistic settings
             context = await browser.new_context(
                 user_agent=get_random_user_agent(),
                 viewport={'width': 1920, 'height': 1080},
                 locale='en-US',
                 timezone_id='America/New_York',
+                # Add more realistic browser features
+                java_script_enabled=True,
+                accept_downloads=False,
+                bypass_csp=True,
+                ignore_https_errors=True,
             )
             
-            # Apply stealth plugin
+            # Inject scripts to avoid detection
+            await context.add_init_script("""
+                // Overwrite the `plugins` property to use a custom getter
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                
+                // Overwrite the `plugins` property
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                
+                // Overwrite the `languages` property
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+                
+                // Mock chrome object
+                window.chrome = {
+                    runtime: {}
+                };
+                
+                // Mock permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+            """)
             
             page = await context.new_page()
             
@@ -358,39 +544,16 @@ async def main() -> None:
                         Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')
                         break
 
-                        # Debug: Log HTML stats
-                    Actor.log.info(f'HTML length: {len(html)} chars')
-                    html_lower = html.lower()
-                    has_job = 'job' in html_lower
-                    has_redirect = 'redirect' in html_lower
-                    has_vacancy = 'vacancy' in html_lower
-                    has_position = 'position' in html_lower
-                    Actor.log.info(f'HTML contains: job={has_job}, redirect={has_redirect}, vacancy={has_vacancy}, position={has_position}')
-                
-                    # Save HTML sample for debugging (first page only)
-                    if page == 1:
-                        try:
-                            await Actor.set_value('debug_html_sample', html[:50000], content_type='text/html')
-                            Actor.log.info('Saved HTML sample to key-value store (debug_html_sample)')
-                        except Exception as e:
-                            Actor.log.debug(f'Failed to save HTML sample: {e}')
+                    soup = BeautifulSoup(html, 'lxml')
 
-                    soup = BeautifulSoup(html, 'html.parser')
                 
-                    # Debug: Count all links
-                    all_links = soup.find_all('a', href=True)
-                    Actor.log.info(f'Found {len(all_links)} total links on page')
-                    redirect_links = [a for a in all_links if 'redirect' in a.get('href', '').lower()]
-                    job_links = [a for a in all_links if any(p in a.get('href', '').lower() for p in ['job', 'vacancy', 'position'])]
-                    Actor.log.info(f'Found {len(redirect_links)} redirect links, {len(job_links)} job-related links')
+                    # Extract jobs using hybrid approach
                     blocks = extract_job_blocks(soup)
-                    if not blocks:
-                        # Log what we found for debugging
-                        Actor.log.warning(f'No job blocks found. Total links: {len(all_links)}, Redirect links: {len(redirect_links)}, Job links: {len(job_links)}')
-
-                    collected_any = False
+                    Actor.log.info(f'Found {len(blocks)} job blocks on page {page_num}')
 
                     new_items_on_page = 0
+                    
+                    # Try parsing job blocks first
                     for block in blocks:
                         item = parse_job_block(block, page_url=url)
                         if not item:
@@ -401,59 +564,60 @@ async def main() -> None:
 
                         # Enrich with metadata
                         item['source_url'] = url
-                        item['page_number'] = page
+                        item['page_number'] = page_num
                         await Actor.push_data(item)
                         total_pushed += 1
                         new_items_on_page += 1
                         if job_url:
                             seen_urls.add(job_url)
-                        collected_any = True
 
-                    if not collected_any:
-                        # Try JSON-LD fallback
+                    # Fallback: Try JSON-LD if no blocks found
+                    if new_items_on_page == 0:
+                        Actor.log.info('No jobs from blocks, trying JSON-LD extraction')
                         ld_jobs = extract_jobs_from_ld_json(soup)
                         for item in ld_jobs:
                             job_url = item.get('job_url')
                             if job_url and job_url in seen_urls:
                                 continue
                             item['source_url'] = url
-                            item['page_number'] = page
+                            item['page_number'] = page_num
                             await Actor.push_data(item)
                             total_pushed += 1
                             new_items_on_page += 1
                             if job_url:
                                 seen_urls.add(job_url)
-                            collected_any = True
 
-                    if not collected_any:
-                        # As a last resort, scan anchors directly for job links
+                    # Last resort: Direct link extraction
+                    if new_items_on_page == 0:
+                        Actor.log.info('No jobs from JSON-LD, trying direct link extraction')
                         link_jobs = extract_jobs_from_links(soup, page_url=url)
                         for item in link_jobs:
                             job_url = item.get('job_url')
                             if job_url and job_url in seen_urls:
                                 continue
                             item['source_url'] = url
-                            item['page_number'] = page
+                            item['page_number'] = page_num
                             await Actor.push_data(item)
                             total_pushed += 1
                             new_items_on_page += 1
                             if job_url:
                                 seen_urls.add(job_url)
-                        if new_items_on_page == 0:
-                            Actor.log.info('No job blocks, JSON-LD, or anchor-based jobs detected on page, ending.')
-                            break
 
-                    Actor.log.info(f'Page {page}: pushed {new_items_on_page} new items (total {total_pushed}).')
+                    Actor.log.info(f'Page {page_num}: pushed {new_items_on_page} new items (total {total_pushed}).')
+
+                    if new_items_on_page == 0:
+                        Actor.log.info('No jobs found on this page, stopping pagination.')
+                        break
 
                     if max_jobs > 0 and total_pushed >= max_jobs:
                         Actor.log.info(f'Reached maxJobs limit ({max_jobs}). Stopping.')
-                        break
-
-                    if new_items_on_page == 0:
-                        Actor.log.info('No new items on page; stopping pagination early.')
                         break
 
             finally:
                 await browser.close()
 
         Actor.log.info(f'Scrape complete. Total items: {total_pushed}.')
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
