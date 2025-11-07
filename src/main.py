@@ -1,4 +1,4 @@
-"""Apify Actor entry point: Jooble Job Scraper (Python, requests_html + BeautifulSoup).
+"""Apify Actor entry point: Jooble Job Scraper (Python, Playwright + BeautifulSoup).
 
 This Actor fetches job listings from Jooble using query parameters for `ukw` (keyword)
 and `rgns` (region), paginates via `p` parameter, and outputs structured dataset items.
@@ -15,67 +15,20 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 from apify import Actor  # pyright: ignore[reportMissingImports]
 from bs4 import BeautifulSoup
-import httpx
+from playwright.async_api import async_playwright, Browser, Page
+from playwright_stealth import stealth_async
 
-# Stealth headers / random user-agents
-try:
-    # Minimal, defensive import in case environment lacks stealthkit
-    from stealthkit import user_agent as sk_user_agent
-    from stealthkit.headers import build_headers as sk_build_headers
-except Exception:  # pragma: no cover - fallback if stealthkit not available
-    sk_user_agent = None
-    sk_build_headers = None
-
-
-# Optional Chrome TLS impersonation client (stealth TLS/JA3)
-try:
-    from curl_cffi import requests as curl_requests  # type: ignore
-except Exception:  # pragma: no cover - fallback if curl_cffi not available
-    curl_requests = None
-
-def build_stealth_headers(referer: Optional[str] = None) -> Dict[str, str]:
-    """Return randomized, browser-like headers using stealthkit if available.
-
-    Falls back to a simple rotating User-Agent list if stealthkit is unavailable.
-    """
-    if sk_build_headers and sk_user_agent:
-        ua = sk_user_agent.random()
-        headers = sk_build_headers(user_agent=ua)
-    else:
-        # Use latest, most common User-Agents from real browsers
-        fallback_uas = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
-        ]
-        ua = random.choice(fallback_uas)
-        
-        # More realistic header order and values matching real browsers
-        headers = {
-            'User-Agent': ua,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'max-age=0',
-            'Sec-Ch-Ua': '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"Windows"',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Upgrade-Insecure-Requests': '1',
-            'DNT': '1',
-        }
-    
-    if referer:
-        headers['Referer'] = referer
-        # When we have a referer, it means we're navigating within the site
-        headers['Sec-Fetch-Site'] = 'same-origin'
-    
-    return headers
+# Stealth headers / random user-agents for Playwright
+def get_random_user_agent() -> str:
+    """Return a random modern user agent."""
+    uas = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+    ]
+    return random.choice(uas)
 
 
 def absolute_url(base: str, href: Optional[str]) -> Optional[str]:
@@ -153,7 +106,7 @@ def extract_jobs_from_ld_json(page_soup: BeautifulSoup) -> List[Dict[str, Any]]:
                     'date_posted': date_posted,
                     'job_type': None,
                     'job_url': url,
-                    'description_text': BeautifulSoup(descr, 'lxml').get_text(strip=True) if isinstance(descr, str) else None,
+                    'description_text': BeautifulSoup(descr, 'html.parser').get_text(strip=True) if isinstance(descr, str) else None,
                     'description_html': descr if isinstance(descr, str) else None,
                     'salary': salary,
                 }
@@ -301,7 +254,7 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
                                 'div[class*="snippet" i]',
                             ])
                             if desc_html:
-                                description_text = BeautifulSoup(desc_html, 'lxml').get_text(strip=True)
+                                description_text = BeautifulSoup(desc_html, 'html.parser').get_text(strip=True)
                         container = container.parent
             except Exception:
                 pass
@@ -355,68 +308,6 @@ def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dic
     return items
 
 
-async def try_ajax_endpoints(session: httpx.AsyncClient, base_url: str, keyword: str, region: str) -> List[Dict[str, Any]]:
-    """Try to find AJAX endpoints that return job data in JSON format."""
-    jobs = []
-    
-    # Common AJAX patterns for job sites
-    ajax_patterns = [
-        f"/api/jobs?keyword={urllib.parse.quote(keyword)}&region={urllib.parse.quote(region)}",
-        f"/api/search?q={urllib.parse.quote(keyword)}&location={urllib.parse.quote(region)}",
-        f"/api/vacancies?search={urllib.parse.quote(keyword)}&location={urllib.parse.quote(region)}",
-        f"/search/jobs?keyword={urllib.parse.quote(keyword)}&region={urllib.parse.quote(region)}",
-        f"/jobs/search?q={urllib.parse.quote(keyword)}&loc={urllib.parse.quote(region)}",
-    ]
-    
-    headers = build_stealth_headers()
-    headers.update({
-        'Accept': 'application/json, text/plain, */*',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': base_url,
-    })
-    
-    for pattern in ajax_patterns:
-        try:
-            ajax_url = urllib.parse.urljoin(base_url, pattern)
-            Actor.log.info(f'Trying AJAX endpoint: {ajax_url}')
-            
-            resp = await session.get(ajax_url, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    if isinstance(data, dict) and 'jobs' in data:
-                        jobs_data = data['jobs']
-                    elif isinstance(data, list):
-                        jobs_data = data
-                    else:
-                        continue
-                        
-                    for job_data in jobs_data:
-                        if isinstance(job_data, dict):
-                            job_item = {
-                                'job_title': job_data.get('title') or job_data.get('name') or job_data.get('position'),
-                                'company': job_data.get('company') or job_data.get('employer') or job_data.get('organization'),
-                                'location': job_data.get('location') or job_data.get('city') or job_data.get('address'),
-                                'date_posted': job_data.get('datePosted') or job_data.get('created_at') or job_data.get('published'),
-                                'job_type': job_data.get('employmentType') or job_data.get('type') or job_data.get('schedule'),
-                                'job_url': job_data.get('url') or job_data.get('link') or job_data.get('href'),
-                                'description_text': job_data.get('description') or job_data.get('summary'),
-                                'description_html': None,
-                                'salary': job_data.get('salary') or job_data.get('wage') or job_data.get('compensation'),
-                            }
-                            
-                            if job_item['job_title'] or job_item['job_url']:
-                                jobs.append(job_item)
-                                
-                except (ValueError, KeyError) as e:
-                    Actor.log.debug(f'Failed to parse JSON from {ajax_url}: {e}')
-                    continue
-                    
-        except Exception as e:
-            Actor.log.debug(f'AJAX request failed for {pattern}: {e}')
-            continue
-            
-    return jobs
 
 
 def find_pagination_links(page_soup: BeautifulSoup, current_url: str) -> List[str]:
@@ -553,7 +444,7 @@ def parse_job_block(block: BeautifulSoup, page_url: str) -> Optional[Dict[str, A
     description_text = None
     if description_html:
         # Parse again to clean text
-        description_text = BeautifulSoup(description_html, 'lxml').get_text(strip=True)
+        description_text = BeautifulSoup(description_html, 'html.parser').get_text(strip=True)
 
     # Job type heuristic: look for tags inside description or chips
     job_type = select_first_text(block, [
@@ -581,101 +472,42 @@ def parse_job_block(block: BeautifulSoup, page_url: str) -> Optional[Dict[str, A
     }
 
 
-async def fetch_search_page(session: httpx.AsyncClient, url: str, referer: Optional[str], effective_proxy: Optional[str]) -> Optional[str]:
-    headers = build_stealth_headers(referer=referer)
+async def fetch_search_page(page: Page, url: str, referer: Optional[str]) -> Optional[str]:
+    """Fetch the HTML content of a search page using Playwright with stealth measures."""
     
-    # Realistic cookies that browsers typically send
-    cookies = {
-        'cookiesAccepted': '1',
-    }
-
-    # Retry with different strategies to avoid 403
-    max_attempts = 5
-    backoff_base = 2.0
+    # Set referer if provided
+    if referer:
+        await page.set_extra_http_headers({'Referer': referer})
     
-    for attempt in range(1, max_attempts + 1):
-        try:
-            # Longer delay on retries to avoid rate limiting
-            if attempt > 1:
-                delay = backoff_base * (2 ** (attempt - 2)) + random.uniform(1.0, 3.0)
-                Actor.log.info(f'Waiting {delay:.1f}s before retry {attempt}...')
-                await asyncio.sleep(delay)
-            else:
-                # Small initial delay to simulate human behavior
-                await asyncio.sleep(random.uniform(1.0, 2.5))
-            
-            # Rotate headers on each retry to avoid fingerprinting
-            if attempt > 1:
-                headers = build_stealth_headers(referer=referer)
-
-            resp = await session.get(url, headers=headers, cookies=cookies, timeout=30.0, follow_redirects=True)
-            status = resp.status_code
-
-            html_text = resp.text
-            
-            # Log response for debugging
-            Actor.log.info(f'Response status: {status}, HTML length: {len(html_text)} chars')
-            
-            # Check if we got blocked
-            if status == 403:
-                Actor.log.warning(f'Got 403 Forbidden on attempt {attempt}. Trying different approach...')
-                
-                # First, try a curl_cffi Chrome TLS impersonation fetch (sync within thread)
-                if curl_requests is not None:
-                    try:
-                        def do_curl_fetch() -> Optional[str]:
-                            proxies = None
-                            if effective_proxy:
-                                proxies = {"http": effective_proxy, "https": effective_proxy}
-                            r = curl_requests.get(
-                                url,
-                                headers=headers,
-                                cookies=cookies,
-                                impersonate="chrome",
-                                proxies=proxies,
-                                timeout=30,
-                                allow_redirects=True,
-                            )
-                            if r.status_code == 200 and len(r.text) > 1000:
-                                return r.text
-                            return None
-                        alt_html = await asyncio.to_thread(do_curl_fetch)
-                        if alt_html:
-                            Actor.log.info('curl_cffi impersonation succeeded after 403.')
-                            return alt_html
-                    except Exception as e:
-                        Actor.log.debug(f'curl_cffi impersonation failed: {e}')
-
-                # On 403 without success, retry with rotated headers
-                if attempt < max_attempts:
-                    continue
-                Actor.log.error(f'Still getting 403 after {max_attempts} attempts. Jooble is blocking this request.')
-                Actor.log.error('SOLUTION: Use Apify Proxy with residential group (apifyProxyGroups: ["RESIDENTIAL"]) to bypass anti-bot protection.')
-                return None
-            
-            # Check for successful response with actual content
-            if status == 200 and len(html_text) > 5000:
-                # Look for job-related content indicators
-                html_lower = html_text.lower()
-                has_content = any(keyword in html_lower for keyword in ['job', 'vacancy', 'position', 'employment', 'career'])
-                
-                if has_content or len(html_text) > 10000:
-                    return html_text
-                else:
-                    Actor.log.warning(f'Got 200 but HTML seems to be a block page (no job keywords found)')
-                    if attempt < max_attempts:
-                        continue
-                    
-            # Other status codes
-            if status in {200, 301, 302}:
-                return html_text
-                
-        except Exception as e:
-            Actor.log.warning(f'Fetch error on attempt {attempt} for {url}: {e}')
-            if attempt >= max_attempts:
-                Actor.log.error(f'Failed to fetch {url} after {max_attempts} attempts')
-
-    return None
+    # Add random delay to mimic human behavior
+    await asyncio.sleep(random.uniform(1.0, 3.0))
+    
+    try:
+        # Navigate to the page
+        response = await page.goto(url, wait_until='networkidle', timeout=30000)
+        if response.status >= 400:
+            Actor.log.warning(f'HTTP {response.status} for {url}')
+            return None
+        
+        # Wait a bit for dynamic content
+        await asyncio.sleep(random.uniform(2.0, 5.0))
+        
+        # Simulate human-like scrolling
+        await page.evaluate("""
+            window.scrollTo({
+                top: Math.floor(Math.random() * 500) + 100,
+                behavior: 'smooth'
+            });
+        """)
+        await asyncio.sleep(random.uniform(1.0, 2.0))
+        
+        # Get the HTML content
+        html = await page.content()
+        return html
+    
+    except Exception as e:
+        Actor.log.error(f'Error fetching {url}: {e}')
+        return None
 
 
 async def main() -> None:
@@ -735,112 +567,114 @@ async def main() -> None:
         total_pushed = 0
         referer_url: Optional[str] = None
 
-        # Use HTTP/2 to better mimic modern browsers, with realistic timeout settings
-        # Configure proxy if provided
-        client_kwargs = {
-            'http2': True,
-            'timeout': 30.0,
-            'follow_redirects': True,
-        }
-        
-        if proxy_url:
-            # For Apify proxy, we need to get the actual proxy URL string
-            if hasattr(proxy_url, 'new_url'):
-                # ProxyConfiguration object - get a new URL for each session
-                proxy_str = await proxy_url.new_url()
-                client_kwargs['proxies'] = proxy_str
-                effective_proxy = proxy_str
-                Actor.log.info(f'Configured session with Apify Proxy')
-            elif isinstance(proxy_url, str):
-                client_kwargs['proxies'] = proxy_url
-                effective_proxy = proxy_url
-                Actor.log.info(f'Configured session with custom proxy')
-        
-        async with httpx.AsyncClient(**client_kwargs) as session:
-            # First, try AJAX endpoints if we have keyword and region
-            if keyword and not start_url:
-                Actor.log.info('Attempting AJAX endpoint detection...')
-                ajax_jobs = await try_ajax_endpoints(session, 'https://jooble.org', keyword, region)
-                for item in ajax_jobs:
-                    job_url = item.get('job_url')
-                    if job_url and job_url not in seen_urls:
-                        item['source_url'] = 'ajax_endpoint'
-                        item['page_number'] = 0
-                        await Actor.push_data(item)
-                        total_pushed += 1
-                        seen_urls.add(job_url)
+        # Launch Playwright browser with stealth
+        async with async_playwright() as p:
+            # Configure browser launch options
+            launch_options = {
+                'headless': True,  # Run headless for server environment
+                'args': [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu',
+                    '--disable-web-security',
+                    '--disable-features=VizDisplayCompositor',
+                ]
+            }
+            
+            # Add proxy if configured
+            if proxy_url:
+                if hasattr(proxy_url, 'new_url'):
+                    proxy_str = await proxy_url.new_url()
+                    launch_options['proxy'] = {'server': proxy_str}
+                    Actor.log.info(f'Configured browser with Apify Proxy')
+                elif isinstance(proxy_url, str):
+                    launch_options['proxy'] = {'server': proxy_url}
+                    Actor.log.info(f'Configured browser with custom proxy')
+            
+            browser = await p.chromium.launch(**launch_options)
+            
+            # Create browser context with stealth
+            context = await browser.new_context(
+                user_agent=get_random_user_agent(),
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
+                timezone_id='America/New_York',
+            )
+            
+            # Apply stealth plugin
+            await stealth_async(context)
+            
+            page = await context.new_page()
+            
+            # Set additional headers to mimic real browser
+            await page.set_extra_http_headers({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Upgrade-Insecure-Requests': '1',
+            })
+            
+            try:
+                # Skip AJAX for now, as Playwright handles dynamic content
+                # If needed, can add back later
                 
-                if ajax_jobs:
-                    Actor.log.info(f'Found {len(ajax_jobs)} jobs via AJAX endpoints')
+                for page_num in range(1, max_pages + 1):
+                    url = page_url(page_num)
+                    Actor.log.info(f'Scraping search page {page_num}: {url}')
 
-            for page in range(1, max_pages + 1):
-                url = page_url(page)
-                Actor.log.info(f'Scraping search page {page}: {url}')
+                    html = await fetch_search_page(page, url, referer=referer_url)
+                    referer_url = url
+                    if not html:
+                        Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')
+                        break
 
-                html = await fetch_search_page(session, url, referer=referer_url, effective_proxy=effective_proxy)
-                referer_url = url
-                if not html:
-                    Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')
-                    break
-
-                # Debug: Log HTML stats
-                Actor.log.info(f'HTML length: {len(html)} chars')
-                html_lower = html.lower()
-                has_job = 'job' in html_lower
-                has_redirect = 'redirect' in html_lower
-                has_vacancy = 'vacancy' in html_lower
-                has_position = 'position' in html_lower
-                Actor.log.info(f'HTML contains: job={has_job}, redirect={has_redirect}, vacancy={has_vacancy}, position={has_position}')
+                        # Debug: Log HTML stats
+                    Actor.log.info(f'HTML length: {len(html)} chars')
+                    html_lower = html.lower()
+                    has_job = 'job' in html_lower
+                    has_redirect = 'redirect' in html_lower
+                    has_vacancy = 'vacancy' in html_lower
+                    has_position = 'position' in html_lower
+                    Actor.log.info(f'HTML contains: job={has_job}, redirect={has_redirect}, vacancy={has_vacancy}, position={has_position}')
                 
-                # Save HTML sample for debugging (first page only)
-                if page == 1:
-                    try:
-                        await Actor.set_value('debug_html_sample', html[:50000], content_type='text/html')
-                        Actor.log.info('Saved HTML sample to key-value store (debug_html_sample)')
-                    except Exception as e:
-                        Actor.log.debug(f'Failed to save HTML sample: {e}')
+                    # Save HTML sample for debugging (first page only)
+                    if page == 1:
+                        try:
+                            await Actor.set_value('debug_html_sample', html[:50000], content_type='text/html')
+                            Actor.log.info('Saved HTML sample to key-value store (debug_html_sample)')
+                        except Exception as e:
+                            Actor.log.debug(f'Failed to save HTML sample: {e}')
 
-                soup = BeautifulSoup(html, 'lxml')
+                    soup = BeautifulSoup(html, 'html.parser')
                 
-                # Debug: Count all links
-                all_links = soup.find_all('a', href=True)
-                Actor.log.info(f'Found {len(all_links)} total links on page')
-                redirect_links = [a for a in all_links if 'redirect' in a.get('href', '').lower()]
-                job_links = [a for a in all_links if any(p in a.get('href', '').lower() for p in ['job', 'vacancy', 'position'])]
-                Actor.log.info(f'Found {len(redirect_links)} redirect links, {len(job_links)} job-related links')
-                blocks = extract_job_blocks(soup)
-                if not blocks:
-                    # Log what we found for debugging
-                    Actor.log.warning(f'No job blocks found. Total links: {len(all_links)}, Redirect links: {len(redirect_links)}, Job links: {len(job_links)}')
+                    # Debug: Count all links
+                    all_links = soup.find_all('a', href=True)
+                    Actor.log.info(f'Found {len(all_links)} total links on page')
+                    redirect_links = [a for a in all_links if 'redirect' in a.get('href', '').lower()]
+                    job_links = [a for a in all_links if any(p in a.get('href', '').lower() for p in ['job', 'vacancy', 'position'])]
+                    Actor.log.info(f'Found {len(redirect_links)} redirect links, {len(job_links)} job-related links')
+                    blocks = extract_job_blocks(soup)
+                    if not blocks:
+                        # Log what we found for debugging
+                        Actor.log.warning(f'No job blocks found. Total links: {len(all_links)}, Redirect links: {len(redirect_links)}, Job links: {len(job_links)}')
 
-                collected_any = False
+                    collected_any = False
 
-                new_items_on_page = 0
-                for block in blocks:
-                    item = parse_job_block(block, page_url=url)
-                    if not item:
-                        continue
-                    job_url = item.get('job_url')
-                    if job_url and job_url in seen_urls:
-                        continue
-
-                    # Enrich with metadata
-                    item['source_url'] = url
-                    item['page_number'] = page
-                    await Actor.push_data(item)
-                    total_pushed += 1
-                    new_items_on_page += 1
-                    if job_url:
-                        seen_urls.add(job_url)
-                    collected_any = True
-
-                if not collected_any:
-                    # Try JSON-LD fallback
-                    ld_jobs = extract_jobs_from_ld_json(soup)
-                    for item in ld_jobs:
+                    new_items_on_page = 0
+                    for block in blocks:
+                        item = parse_job_block(block, page_url=url)
+                        if not item:
+                            continue
                         job_url = item.get('job_url')
                         if job_url and job_url in seen_urls:
                             continue
+
+                        # Enrich with metadata
                         item['source_url'] = url
                         item['page_number'] = page
                         await Actor.push_data(item)
@@ -850,32 +684,51 @@ async def main() -> None:
                             seen_urls.add(job_url)
                         collected_any = True
 
-                if not collected_any:
-                    # As a last resort, scan anchors directly for job links
-                    link_jobs = extract_jobs_from_links(soup, page_url=url)
-                    for item in link_jobs:
-                        job_url = item.get('job_url')
-                        if job_url and job_url in seen_urls:
-                            continue
-                        item['source_url'] = url
-                        item['page_number'] = page
-                        await Actor.push_data(item)
-                        total_pushed += 1
-                        new_items_on_page += 1
-                        if job_url:
-                            seen_urls.add(job_url)
-                    if new_items_on_page == 0:
-                        Actor.log.info('No job blocks, JSON-LD, or anchor-based jobs detected on page, ending.')
+                    if not collected_any:
+                        # Try JSON-LD fallback
+                        ld_jobs = extract_jobs_from_ld_json(soup)
+                        for item in ld_jobs:
+                            job_url = item.get('job_url')
+                            if job_url and job_url in seen_urls:
+                                continue
+                            item['source_url'] = url
+                            item['page_number'] = page
+                            await Actor.push_data(item)
+                            total_pushed += 1
+                            new_items_on_page += 1
+                            if job_url:
+                                seen_urls.add(job_url)
+                            collected_any = True
+
+                    if not collected_any:
+                        # As a last resort, scan anchors directly for job links
+                        link_jobs = extract_jobs_from_links(soup, page_url=url)
+                        for item in link_jobs:
+                            job_url = item.get('job_url')
+                            if job_url and job_url in seen_urls:
+                                continue
+                            item['source_url'] = url
+                            item['page_number'] = page
+                            await Actor.push_data(item)
+                            total_pushed += 1
+                            new_items_on_page += 1
+                            if job_url:
+                                seen_urls.add(job_url)
+                        if new_items_on_page == 0:
+                            Actor.log.info('No job blocks, JSON-LD, or anchor-based jobs detected on page, ending.')
+                            break
+
+                    Actor.log.info(f'Page {page}: pushed {new_items_on_page} new items (total {total_pushed}).')
+
+                    if max_jobs > 0 and total_pushed >= max_jobs:
+                        Actor.log.info(f'Reached maxJobs limit ({max_jobs}). Stopping.')
                         break
 
-                Actor.log.info(f'Page {page}: pushed {new_items_on_page} new items (total {total_pushed}).')
+                    if new_items_on_page == 0:
+                        Actor.log.info('No new items on page; stopping pagination early.')
+                        break
 
-                if max_jobs > 0 and total_pushed >= max_jobs:
-                    Actor.log.info(f'Reached maxJobs limit ({max_jobs}). Stopping.')
-                    break
-
-                if new_items_on_page == 0:
-                    Actor.log.info('No new items on page; stopping pagination early.')
-                    break
+            finally:
+                await browser.close()
 
         Actor.log.info(f'Scrape complete. Total items: {total_pushed}.')

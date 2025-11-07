@@ -1,6 +1,6 @@
 # Jooble Job Scraper
 
-This Apify Actor scrapes job listings from [Jooble.org](https://jooble.org), a global job search platform. It extracts detailed information about job opportunities including titles, companies, locations, salaries, job types, posting dates, and descriptions.
+This Apify Actor scrapes job listings from [Jooble.org](https://jooble.org), a global job search platform. It uses Playwright for browser automation and Beautiful Soup for HTML parsing to extract detailed information about job opportunities including titles, companies, locations, salaries, job types, posting dates, and descriptions.
 
 ## Features
 
@@ -16,7 +16,7 @@ This Apify Actor scrapes job listings from [Jooble.org](https://jooble.org), a g
   - Posting date
   - Job description (text and HTML)
 - **Duplicate Prevention**: Avoids duplicate job listings
-- **Stealth Mode**: Uses randomized headers and user agents to avoid detection
+- **Advanced Anti-Bot Measures**: Uses Playwright with stealth plugins, randomized user agents, human-like browsing behavior (delays, scrolling), and other techniques to avoid detection
 
 ## Input Parameters
 

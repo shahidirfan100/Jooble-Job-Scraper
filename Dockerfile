@@ -3,6 +3,28 @@
 # You can also use any other image from Docker Hub.
 FROM apify/actor-python:3.13
 
+# Switch to root to install system dependencies
+USER root
+
+# Install Playwright dependencies
+RUN apt-get update && apt-get install -y \
+    libnss3 \
+    libnspr4 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Switch back to myuser
 USER myuser
 
 # Second, copy just requirements.txt into the Actor image,
@@ -10,7 +32,7 @@ USER myuser
 # in order to speed up the build
 COPY --chown=myuser:myuser requirements.txt ./
 
-# Install the packages specified in requirements.txt,
+# Install the packages specified in requirements.txt and Playwright browsers
 # Print the installed Python version, pip version
 # and all installed packages with their versions for debugging
 RUN echo "Python version:" \
@@ -19,6 +41,8 @@ RUN echo "Python version:" \
  && pip --version \
  && echo "Installing dependencies:" \
  && pip install -r requirements.txt \
+ && echo "Installing Playwright browsers:" \
+ && playwright install chromium \
  && echo "All installed Python packages:" \
  && pip freeze
 
@@ -31,5 +55,5 @@ COPY --chown=myuser:myuser . ./
 RUN python3 -m compileall -q src/
 
 # Specify how to launch the source code of your Actor.
-# By default, the "python3 -m src" command is run
-CMD ["python3", "-m", "src"]
+# Run main.py directly instead of using module mode
+CMD ["python3", "src/main.py"]
