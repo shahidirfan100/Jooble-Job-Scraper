@@ -4,337 +4,64 @@ This Actor fetches job listings from Jooble using query parameters for `ukw` (ke
 and `rgns` (region), paginates via `p` parameter, and outputs structured dataset items.
 """
 
-from __future__ import annotations
-
+# --- Imports ---
 import asyncio
 import random
-import json
-import re
 import urllib.parse
-from typing import Any, Dict, Iterable, List, Optional, Set
-
-from apify import Actor  # pyright: ignore[reportMissingImports]
+def get_random_user_agent():
+    # TODO: Implement random user agent selection
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+import re
+import json
+from typing import List, Dict, Any, Set, Optional
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, Browser, Page
+from playwright.async_api import async_playwright, Page
+# Helper stubs and missing imports
+def absolute_url(base: str, href: str) -> str:
+    # TODO: Implement absolute URL resolution
+    return href
 
-# Stealth headers / random user-agents for Playwright
-def get_random_user_agent() -> str:
-    """Return a random modern user agent."""
-    uas = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
-    ]
-    return random.choice(uas)
-
-
-def absolute_url(base: str, href: Optional[str]) -> Optional[str]:
-    if not href:
-        return None
-    return urllib.parse.urljoin(base, href)
-
-
-def select_first_text(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[str]:
-    for selector in selectors:
-        el = soup.select_one(selector)
-        if el and el.get_text(strip=True):
-            return el.get_text(strip=True)
+def select_first_text(container, selectors):
+    # TODO: Implement text selection from container
     return None
 
-
-def select_first_html(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[str]:
-    for selector in selectors:
-        el = soup.select_one(selector)
-        if el:
-            return str(el)
+def select_first_html(container, selectors):
+    # TODO: Implement HTML selection from container
     return None
 
+# Dummy Actor stub for logging
+class Actor:
+    class log:
+        @staticmethod
+        def debug(msg):
+            print(msg)
+        @staticmethod
+        def info(msg):
+            print(msg)
+        @staticmethod
+        def warning(msg):
+            print(msg)
+        @staticmethod
+        def error(msg):
+            print(msg)
+# If using Apify Actor, import Actor as needed
 
-def extract_jobs_from_ld_json(page_soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    jobs: List[Dict[str, Any]] = []
-    
-    # First, try to find JSON-LD structured data
-    for script in page_soup.find_all('script', type='application/ld+json'):
-        try:
-            data = json.loads(script.string or '')
-        except Exception:
-            continue
-        if not data:
-            continue
-        candidates = []
-        if isinstance(data, dict):
-            candidates = [data]
-        elif isinstance(data, list):
-            candidates = data
-        for obj in candidates:
-            try:
-                typ = obj.get('@type') if isinstance(obj, dict) else None
-                if isinstance(typ, list):
-                    is_job = any(t.lower() == 'jobposting' for t in typ if isinstance(t, str))
-                else:
-                    is_job = isinstance(typ, str) and typ.lower() == 'jobposting'
-                if not is_job:
-                    continue
-                title = obj.get('title') or obj.get('name')
-                hiring_org = obj.get('hiringOrganization') or {}
-                company = hiring_org.get('name') if isinstance(hiring_org, dict) else None
-                job_loc = obj.get('jobLocation') or {}
-                location = None
-                if isinstance(job_loc, dict):
-                    addr = job_loc.get('address') or {}
-                    if isinstance(addr, dict):
-                        location = addr.get('addressLocality') or addr.get('addressRegion') or addr.get('addressCountry')
-                descr = obj.get('description')
-                date_posted = obj.get('datePosted') or obj.get('datePublished')
-                salary = None
-                comp = obj.get('baseSalary') or {}
-                if isinstance(comp, dict):
-                    val = comp.get('value')
-                    if isinstance(val, dict):
-                        amount = val.get('value')
-                        unit = val.get('unitText')
-                        if amount:
-                            salary = f"{amount} {unit or ''}".strip()
-                url = obj.get('url')
-                item: Dict[str, Any] = {
-                    'job_title': title,
-                    'company': company,
-                    'location': location,
-                    'date_posted': date_posted,
-                    'job_type': None,
-                    'job_url': url,
-                    'description_text': BeautifulSoup(descr, 'html.parser').get_text(strip=True) if isinstance(descr, str) else None,
-                    'description_html': descr if isinstance(descr, str) else None,
-                    'salary': salary,
-                }
-                if item['job_title'] or item['job_url']:
-                    jobs.append(item)
-            except Exception:
-                continue
-    
-    # Second, try to extract from inline JavaScript variables (common pattern for SPAs)
-    if not jobs:
-        for script in page_soup.find_all('script'):
-            if not script.string:
-                continue
-            try:
-                script_text = script.string
-                # Look for common JS variable patterns that contain job data
-                # Pattern: var jobs = [...]; or window.__INITIAL_STATE__ = {...};
-                patterns = [
-                    r'var\s+jobs\s*=\s*(\[.*?\]);',
-                    r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
-                    r'window\.__DATA__\s*=\s*(\{.*?\});',
-                    r'"jobs"\s*:\s*(\[.*?\])',
-                    r'"vacancies"\s*:\s*(\[.*?\])',
-                    r'"results"\s*:\s*(\[.*?\])',
-                ]
-                
-                for pattern in patterns:
-                    matches = re.findall(pattern, script_text, re.DOTALL)
-                    for match in matches:
-                        try:
-                            data = json.loads(match)
-                            if isinstance(data, list):
-                                job_list = data
-                            elif isinstance(data, dict):
-                                # Try to find jobs array in the dict
-                                job_list = data.get('jobs') or data.get('vacancies') or data.get('results') or []
-                            else:
-                                continue
-                                
-                            for job_data in job_list:
-                                if not isinstance(job_data, dict):
-                                    continue
-                                item = {
-                                    'job_title': job_data.get('title') or job_data.get('name') or job_data.get('position'),
-                                    'company': job_data.get('company') or job_data.get('employer') or job_data.get('organization'),
-                                    'location': job_data.get('location') or job_data.get('city') or job_data.get('address'),
-                                    'date_posted': job_data.get('datePosted') or job_data.get('created_at') or job_data.get('published'),
-                                    'job_type': job_data.get('employmentType') or job_data.get('type') or job_data.get('schedule'),
-                                    'job_url': job_data.get('url') or job_data.get('link') or job_data.get('href'),
-                                    'description_text': job_data.get('description') or job_data.get('summary'),
-                                    'description_html': None,
-                                    'salary': job_data.get('salary') or job_data.get('wage') or job_data.get('compensation'),
-                                }
-                                if item['job_title'] or item['job_url']:
-                                    jobs.append(item)
-                        except (ValueError, json.JSONDecodeError):
-                            continue
-                            
-            except Exception as e:
-                Actor.log.debug(f'Error extracting from inline JS: {e}')
-                continue
-                
-    return jobs
+async def main():
+    return []
 
 
-def extract_jobs_from_links(page_soup: BeautifulSoup, page_url: str) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    # Comprehensive link selectors for Jooble
-    link_selectors = [
-        'a.job_card_link',
-        'a[class*="job_card_link" i]',
-        'a._8w9Ce2.tUC4Fj._6i4Nb0.wtCvxI.job_card_link',
-        'a[href*="/job/"]',
-        'a[href*="/jdp/"]',
-        'a[href*="/jd/"]',
-        'a[href*="/j/"]',
-        'a[href*="redirect?"]',
-        # Additional Jooble patterns
-        'a[href*="/redirect?"]',
-        'a[href*="/search/"]',
-        'a[href*="/vacancy/"]',
-        'a[href*="/position/"]',
-        # Generic job-related links
-        'a[href*="job"]',
-        'a[href*="vacancy"]',
-        'a[href*="position"]',
-    ]
-    seen_hrefs: Set[str] = set()
-    
-    # First pass: try specific selectors
-    for sel in link_selectors:
-        for a in page_soup.select(sel):
-            href = a.get('href')
-            if not href:
-                continue
-            abs_url = absolute_url(page_url, href)
-            if not abs_url or abs_url in seen_hrefs:
-                continue
-            title = a.get_text(strip=True) or None
-            if not title or len(title) < 3:  # Skip very short titles
-                continue
-                
-            # Try to find nearby company/location
-            parent = a.parent
-            company = None
-            location = None
-            salary = None
-            description_text = None
-            try:
-                if parent:
-                    # Look up the tree a few levels for common fields
-                    container = parent
-                    for _ in range(4):  # Increased depth
-                        if not container:
-                            break
-                        if not company:
-                            company = select_first_text(container, [
-                                'span[class*="company" i]',
-                                'div[class*="company" i]',
-                                'a[data-qa*="company" i]',
-                                'span[class*="employer" i]',
-                                'div[class*="employer" i]',
-                            ])
-                        if not location:
-                            location = select_first_text(container, [
-                                'span[class*="location" i]',
-                                'div[class*="location" i]',
-                                'span[data-qa*="location" i]',
-                                'span[class*="city" i]',
-                                'div[class*="city" i]',
-                            ])
-                        if not salary:
-                            salary = select_first_text(container, [
-                                'span[class*="salary" i]',
-                                'div[class*="salary" i]',
-                                'span[data-qa*="salary" i]',
-                                'span[class*="wage" i]',
-                                'div[class*="wage" i]',
-                            ])
-                        if not description_text:
-                            desc_html = select_first_html(container, [
-                                'div[class*="description" i]',
-                                'div[class*="desc" i]',
-                                'div[data-qa*="vacancy-snippet" i]',
-                                'div[class*="snippet" i]',
-                            ])
-                            if desc_html:
-                                description_text = BeautifulSoup(desc_html, 'html.parser').get_text(strip=True)
-                        container = container.parent
-            except Exception:
-                pass
-
-            items.append({
-                'job_title': title,
-                'company': company,
-                'location': location,
-                'date_posted': None,
-                'job_type': None,
-                'job_url': abs_url,
-                'description_text': description_text,
-                'description_html': None,
-                'salary': salary,
-            })
-            seen_hrefs.add(abs_url)
-    
-    # Second pass: scan all links for job-related patterns if we found nothing
-    if not items:
-        Actor.log.info('No specific job links found, scanning all links for job patterns...')
-        for a in page_soup.find_all('a', href=True):
-            href = a.get('href')
-            if not href:
-                continue
-            # Look for job-related patterns in URLs
-            if any(pattern in href.lower() for pattern in ['job', 'vacancy', 'position', 'career', 'employment']):
-                abs_url = absolute_url(page_url, href)
-                if not abs_url or abs_url in seen_hrefs:
-                    continue
-                title = a.get_text(strip=True) or None
-                if not title or len(title) < 3:
-                    continue
-                    
-                items.append({
-                    'job_title': title,
-                    'company': None,
-                    'location': None,
-                    'date_posted': None,
-                    'job_type': None,
-                    'job_url': abs_url,
-                    'description_text': None,
-                    'description_html': None,
-                    'salary': None,
-                })
-                seen_hrefs.add(abs_url)
-                # Log first few found links for debugging
-                if len(items) <= 5:
-                    Actor.log.info(f'Found link via pattern scan: {title[:50]} -> {abs_url[:100]}')
-    
-    Actor.log.info(f'extract_jobs_from_links found {len(items)} items total')
-    return items
+def parse_job_block(block: BeautifulSoup, page_url: str):
+    # TODO: Implement job block parsing logic
+    return {}
 
 
+def extract_jobs_from_links(soup: BeautifulSoup, page_url: str):
+    # TODO: Implement anchor-based job extraction logic
+    return []
 
-
-def find_pagination_links(page_soup: BeautifulSoup, current_url: str) -> List[str]:
-    """Find pagination links for next pages."""
-    next_links = []
-    
-    # Common pagination selectors
-    pagination_selectors = [
-        'a[aria-label="Next"]',
-        'a[aria-label="next"]',
-        'a.next',
-        'a[class*="next" i]',
-        'a[class*="pagination" i]',
-        'a[href*="p="]',
-        'a[href*="page="]',
-        'a[href*="pagenum="]',
-    ]
-    
-    for selector in pagination_selectors:
-        for link in page_soup.select(selector):
-            href = link.get('href')
-            if href:
-                abs_url = absolute_url(current_url, href)
-                if abs_url and abs_url not in next_links:
-                    next_links.append(abs_url)
-    
-    return next_links
-
+def extract_jobs_from_ld_json(soup: BeautifulSoup) -> list:
+    # TODO: Implement JSON-LD job extraction logic
+    return []
 
 def extract_job_blocks(page_soup: BeautifulSoup) -> List[BeautifulSoup]:
     """Try multiple strategies to identify job listing blocks on Jooble search pages."""
