@@ -326,66 +326,105 @@ def parse_job_block(block: Tag, page_url: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None) -> Optional[str]:
-    """Fetch the HTML content of a search page using Playwright with stealth measures."""
-    
-    # Set referer if provided
-    if referer:
-        await page.set_extra_http_headers({'Referer': referer})
-    
-    # Add random delay to mimic human behavior
-    await asyncio.sleep(random.uniform(1.5, 3.5))
-    
-    try:
-        # Navigate to the page with realistic timeout
-        response = await page.goto(url, wait_until='domcontentloaded', timeout=45000)
-        if not response:
-            Actor.log.error(f'No response from {url}')
-            return None
-            
-        if response.status >= 400:
-            Actor.log.warning(f'HTTP {response.status} for {url}')
-            return None
-        
-        # Wait for content to load - Jooble uses dynamic rendering
+async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None, page_num: Optional[int] = None) -> Optional[str]:
+    """Fetch the HTML content of a search page using Playwright with retries and diagnostics.
+
+    This function will try multiple attempts with exponential backoff, rotate user-agents,
+    and on final failure save a screenshot and HTML snippet to Key-Value store for debugging.
+    """
+    max_attempts = 3
+    base_delay = 2.0
+
+    for attempt in range(1, max_attempts + 1):
+        ua = get_random_user_agent()
+        # Set reasonable headers including User-Agent and Referer
+        headers = {'User-Agent': ua, 'Accept-Language': 'en-US,en;q=0.9'}
+        if referer:
+            headers['Referer'] = referer
+
         try:
-            # Wait for job listings to appear
-            await page.wait_for_selector('article, a[href*="/redirect"], div[class*="job"]', timeout=15000)
+            # Slight random delay before attempt
+            await asyncio.sleep(random.uniform(0.5, 1.5) * attempt)
+
+            await page.set_extra_http_headers(headers)
+
+            Actor.log.info(f'Attempt {attempt}/{max_attempts} fetching {url} with UA: {ua[:60]}')
+            response = await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+
+            if not response:
+                Actor.log.warning(f'No response object on attempt {attempt} for {url}')
+                raise RuntimeError('No response')
+
+            status = response.status
+            Actor.log.debug(f'Navigation response status: {status} for {url}')
+
+            if status == 403 or status == 429:
+                Actor.log.warning(f'Blocked or rate-limited (status {status}) on attempt {attempt} for {url}')
+                # If last attempt, capture diagnostics
+                if attempt == max_attempts:
+                    try:
+                        key = f'fail_screenshot_page_{page_num or "na"}_attempt_{attempt}.png'
+                        screenshot = await page.screenshot(full_page=False)
+                        await Actor.set_value(key, screenshot, content_type='image/png')
+                        html_snip = await page.content()
+                        await Actor.set_value(f'fail_html_page_{page_num or "na"}_attempt_{attempt}.html', html_snip[:10000], content_type='text/html')
+                    except Exception as e:
+                        Actor.log.debug(f'Failed to save diagnostics: {e}')
+                # Try again with backoff
+                await asyncio.sleep(base_delay * attempt)
+                continue
+
+            if status >= 400:
+                Actor.log.warning(f'HTTP error {status} for {url} on attempt {attempt}')
+                if attempt == max_attempts:
+                    # Save diagnostics
+                    try:
+                        await Actor.set_value(f'fail_status_page_{page_num or "na"}', str(status), content_type='text/plain')
+                        html_snip = await page.content()
+                        await Actor.set_value(f'fail_html_page_{page_num or "na"}_attempt_{attempt}.html', html_snip[:10000], content_type='text/html')
+                    except Exception as e:
+                        Actor.log.debug(f'Failed to save error snapshot: {e}')
+                    return None
+                await asyncio.sleep(base_delay * attempt)
+                continue
+
+            # Wait for job listing elements (best-effort)
+            try:
+                await page.wait_for_selector('article, a[href*="/redirect"], div[class*="job"]', timeout=12000)
+            except Exception as e:
+                Actor.log.debug(f'Wait for selector timed out: {e}')
+
+            # Simulate light scrolling
+            try:
+                await page.evaluate("""
+                    () => { window.scrollBy(0, window.innerHeight / 2); }
+                """)
+            except Exception:
+                pass
+
+            # Final small delay to allow async content
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+
+            html = await page.content()
+            Actor.log.info(f'Successfully fetched {url} (len={len(html)}) on attempt {attempt}')
+            return html
+
         except Exception as e:
-            Actor.log.debug(f'Timeout waiting for job listings: {e}')
-        
-        # Additional wait for dynamic content
-        await asyncio.sleep(random.uniform(2.0, 4.0))
-        
-        # Simulate human-like scrolling behavior
-        await page.evaluate("""
-            async () => {
-                // Smooth scroll down
-                await new Promise(resolve => {
-                    let totalHeight = 0;
-                    const distance = Math.floor(Math.random() * 200) + 100;
-                    const timer = setInterval(() => {
-                        const scrollHeight = document.documentElement.scrollHeight;
-                        window.scrollBy(0, distance);
-                        totalHeight += distance;
-                        if(totalHeight >= scrollHeight / 2){
-                            clearInterval(timer);
-                            resolve();
-                        }
-                    }, 100);
-                });
-            }
-        """)
-        await asyncio.sleep(random.uniform(1.0, 2.0))
-        
-        # Get the HTML content
-        html = await page.content()
-        Actor.log.info(f'Successfully fetched page: {len(html)} chars')
-        return html
-    
-    except Exception as e:
-        Actor.log.error(f'Error fetching {url}: {e}')
-        return None
+            Actor.log.warning(f'Attempt {attempt} failed for {url}: {e}')
+            if attempt == max_attempts:
+                # Save screenshot and HTML snippet for diagnosis
+                try:
+                    key = f'exception_screenshot_page_{page_num or "na"}_attempt_{attempt}.png'
+                    screenshot = await page.screenshot(full_page=False)
+                    await Actor.set_value(key, screenshot, content_type='image/png')
+                    html_snip = await page.content()
+                    await Actor.set_value(f'exception_html_page_{page_num or "na"}_attempt_{attempt}.html', html_snip[:15000], content_type='text/html')
+                except Exception as e2:
+                    Actor.log.debug(f'Failed to save final diagnostics: {e2}')
+                return None
+            # Exponential backoff before retrying
+            await asyncio.sleep(base_delay * attempt)
+    return None
 
 
 async def main() -> None:
@@ -469,13 +508,37 @@ async def main() -> None:
             
             # Add proxy if configured
             if proxy_url:
-                if hasattr(proxy_url, 'new_url'):
-                    proxy_str = await proxy_url.new_url()
-                    launch_options['proxy'] = {'server': proxy_str}
-                    Actor.log.info(f'Configured browser with Apify Proxy')
-                elif isinstance(proxy_url, str):
-                    launch_options['proxy'] = {'server': proxy_url}
-                    Actor.log.info(f'Configured browser with custom proxy')
+                try:
+                    # Resolve proxy string (ProxyConfiguration has new_url())
+                    proxy_str = None
+                    if hasattr(proxy_url, 'new_url'):
+                        proxy_str = await proxy_url.new_url()
+                    elif isinstance(proxy_url, str):
+                        proxy_str = proxy_url
+
+                    if proxy_str:
+                        # Parse credentials if present and pass them separately to Playwright
+                        parsed = urllib.parse.urlparse(proxy_str)
+                        scheme = parsed.scheme or 'http'
+                        host = parsed.hostname
+                        port = parsed.port
+                        username = parsed.username
+                        password = parsed.password
+                        if host and port:
+                            server = f"{scheme}://{host}:{port}"
+                        else:
+                            server = proxy_str
+
+                        proxy_option = {'server': server}
+                        if username:
+                            proxy_option['username'] = urllib.parse.unquote(username)
+                        if password:
+                            proxy_option['password'] = urllib.parse.unquote(password)
+
+                        launch_options['proxy'] = proxy_option
+                        Actor.log.info(f'Configured browser with proxy server={server} user={bool(username)}')
+                except Exception as e:
+                    Actor.log.error(f'Failed to configure proxy for Playwright: {e}')
             
             browser = await p.chromium.launch(**launch_options)
             
@@ -584,7 +647,7 @@ async def main() -> None:
                     url = page_url(page_num)
                     Actor.log.info(f'Scraping search page {page_num}: {url}')
 
-                    html = await fetch_search_page(page, url, referer=referer_url)
+                    html = await fetch_search_page(page, url, referer=referer_url, page_num=page_num)
                     referer_url = url
                     if not html:
                         Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')
