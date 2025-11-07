@@ -16,7 +16,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from apify import Actor  # pyright: ignore[reportMissingImports]
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Browser, Page
-from playwright_stealth import stealth_async
 
 # Stealth headers / random user-agents for Playwright
 def get_random_user_agent() -> str:
@@ -606,7 +605,6 @@ async def main() -> None:
             )
             
             # Apply stealth plugin
-            await stealth_async(context)
             
             page = await context.new_page()
             
