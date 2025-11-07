@@ -408,10 +408,14 @@ async def main() -> None:
         if proxy_config:
             use_apify_proxy = proxy_config.get('useApifyProxy', False)
             if use_apify_proxy:
-                # Get Apify proxy URL from the Actor configuration
-                proxy_url = Actor.create_proxy_configuration(actor_proxy_input=proxy_config)
-                if proxy_url:
+                # Create Apify Proxy configuration object (async) and use it
+                try:
+                    proxy_cfg = await Actor.create_proxy_configuration(actor_proxy_input=proxy_config)
+                    proxy_url = proxy_cfg
                     Actor.log.info('Using Apify Proxy to avoid IP blocking')
+                except Exception as e:
+                    Actor.log.error(f'Failed to create Apify proxy configuration: {e}')
+                    proxy_url = None
             elif proxy_config.get('proxyUrls'):
                 # Use custom proxy if provided
                 proxy_urls = proxy_config.get('proxyUrls', [])
@@ -520,7 +524,30 @@ async def main() -> None:
             """)
             
             page = await context.new_page()
-            
+
+            # Network and console event handlers for debugging connectivity
+            def _on_request_failed(request):
+                try:
+                    Actor.log.warning(f'Request failed: {request.url} - {getattr(request, "failure", None)}')
+                except Exception:
+                    pass
+
+            def _on_console(msg):
+                try:
+                    Actor.log.debug(f'Console [{msg.type}]: {msg.text}')
+                except Exception:
+                    pass
+
+            def _on_response(response):
+                try:
+                    Actor.log.debug(f'Response: {response.url} -> {response.status}')
+                except Exception:
+                    pass
+
+            page.on('requestfailed', _on_request_failed)
+            page.on('console', _on_console)
+            page.on('response', _on_response)
+
             # Set additional headers to mimic real browser
             await page.set_extra_http_headers({
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -529,6 +556,25 @@ async def main() -> None:
                 'DNT': '1',
                 'Upgrade-Insecure-Requests': '1',
             })
+
+            # Quick connectivity health checks to help debug network blocking
+            try:
+                health = await page.goto('https://example.com', wait_until='domcontentloaded', timeout=20000)
+                Actor.log.info(f'Health check example.com status: {health.status if health else "no-response"}')
+            except Exception as e:
+                Actor.log.warning(f'Health check example.com failed: {e}')
+
+            try:
+                jooble_health = await page.goto('https://jooble.org', wait_until='domcontentloaded', timeout=30000)
+                Actor.log.info(f'Jooble root status: {jooble_health.status if jooble_health else "no-response"}')
+                if jooble_health and jooble_health.status == 200:
+                    try:
+                        txt = await jooble_health.text()
+                        await Actor.set_value('jooble_root_snippet', txt[:2000], content_type='text/plain')
+                    except Exception:
+                        pass
+            except Exception as e:
+                Actor.log.warning(f'Jooble health check failed: {e}')
             
             try:
                 # Skip AJAX for now, as Playwright handles dynamic content
