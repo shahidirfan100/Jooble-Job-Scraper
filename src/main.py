@@ -213,19 +213,95 @@ def absolute_url(base: str, href: str) -> str:
 
 
 def select_first_text(container: Tag, selectors: List[str]) -> Optional[str]:
-    """Try multiple selectors and return first non-empty text."""
+    """Try multiple selectors and return first non-empty text. Handles edge cases and nested extraction."""
     if not container:
         return None
+    
     for selector in selectors:
         try:
             elem = container.select_one(selector)
             if elem:
                 text = elem.get_text(strip=True)
-                if text:
-                    return text
+                if text and len(text) > 0:
+                    # Clean up common junk
+                    text = text.replace('\xa0', ' ').strip()
+                    if text:
+                        return text
         except Exception:
             continue
+    
+    # Fallback: Try to extract any text from container siblings if selector approach fails
+    if not selector.startswith('['):  # Only if original selector wasn't attribute-based
+        try:
+            # Get all direct text nodes and immediate children's text
+            text = container.get_text(strip=True, separator=' ')
+            if text and len(text) > 2:
+                return text[:100]  # Return first 100 chars max
+        except Exception:
+            pass
+    
     return None
+
+
+def extract_metadata_from_container(container: Tag) -> Dict[str, Optional[str]]:
+    """Extract all metadata from a job listing container using aggressive parsing."""
+    metadata = {
+        'company': None,
+        'location': None,
+        'salary': None,
+        'date_posted': None,
+        'job_type': None,
+        'description_text': None,
+    }
+    
+    if not container:
+        return metadata
+    
+    try:
+        # Get all text nodes from the container
+        all_text = container.get_text(' ', strip=True)
+        
+        # Look for patterns that indicate metadata
+        lines = [line.strip() for line in all_text.split('\n') if line.strip()]
+        
+        for i, line in enumerate(lines):
+            # Skip title (handled separately)
+            if len(line) < 5:
+                continue
+            
+            # Salary detection
+            if not metadata['salary'] and any(c in line for c in ['$', '£', '€', '¥']):
+                metadata['salary'] = line
+            
+            # Company detection (usually bold or in specific position)
+            elif not metadata['company'] and len(line) < 50 and i < 3:
+                # Company names are usually shorter, near top
+                metadata['company'] = line
+            
+            # Location detection (often contains common location words)
+            elif not metadata['location'] and any(word in line.lower() for word in ['city', 'state', 'region', 'location', 'area', 'county']):
+                metadata['location'] = line
+            elif not metadata['location'] and ',' in line and len(line) < 50:
+                # Might be location (e.g., "New York, NY")
+                metadata['location'] = line
+            
+            # Date detection (contains time-related words)
+            elif not metadata['date_posted'] and any(word in line.lower() for word in ['ago', 'posted', 'days', 'hours', 'today', 'yesterday', '2025', '2024']):
+                metadata['date_posted'] = line
+            
+            # Employment type detection
+            elif not metadata['job_type'] and any(word in line.lower() for word in ['full-time', 'part-time', 'contract', 'freelance', 'temporary', 'permanent']):
+                metadata['job_type'] = line
+            
+            # Description (longer text that's not metadata)
+            elif not metadata['description_text'] and len(line) > 20 and len(line) < 200:
+                if not any(word in line.lower() for word in ['$', '£', 'job', 'position', 'role']):
+                    metadata['description_text'] = line
+    
+    except Exception as e:
+        pass
+    
+    return metadata
 
 
 # --- Job Extraction Functions ---
@@ -344,39 +420,92 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
                 continue
             
             # Try to find additional info from parent container
-            parent = link.find_parent(['div', 'article', 'li', 'section'])
+            parent = link.find_parent(['div', 'article', 'li', 'section', 'tr'])
+            
+            # If no direct parent found, try siblings
+            if not parent:
+                parent = link.find_parent()
+            
             company = None
             location = None
             salary = None
             date_posted = None
             job_type = None
+            description_text = None
             
             if parent:
                 company = select_first_text(parent, [
                     'span[class*="company" i]',
                     'div[class*="company" i]',
                     'a[class*="company" i]',
+                    'div[class*="employer" i]',
+                    'span[class*="employer" i]',
+                    'div[class*="organization" i]',
+                    'b',  # Bold text often is company name
+                    'strong',  # Strong text often is company name
                 ])
                 location = select_first_text(parent, [
                     'span[class*="location" i]',
                     'div[class*="location" i]',
                     'span[class*="city" i]',
+                    'div[class*="city" i]',
+                    'span[class*="place" i]',
+                    'div[class*="place" i]',
+                    'span[class*="region" i]',
+                    'span[class*="area" i]',
+                    'div[class*="geo" i]',
                 ])
                 salary = select_first_text(parent, [
                     'span[class*="salary" i]',
                     'div[class*="salary" i]',
                     'span[class*="wage" i]',
+                    'div[class*="wage" i]',
+                    'span[class*="pay" i]',
+                    'div[class*="pay" i]',
+                    'span[class*="compensation" i]',
+                    'div[class*="compensation" i]',
                 ])
                 date_posted = select_first_text(parent, [
                     'span[class*="date" i]',
+                    'div[class*="date" i]',
                     'time',
                     'span[class*="posted" i]',
+                    'span[class*="publish" i]',
+                    'span[class*="ago" i]',
+                    'span[class*="time" i]',
                 ])
                 job_type = select_first_text(parent, [
                     'span[class*="type" i]',
                     'span[class*="schedule" i]',
                     'span[class*="employment" i]',
+                    'span[class*="category" i]',
+                    'div[class*="type" i]',
+                    'div[class*="schedule" i]',
                 ])
+                description_text = select_first_text(parent, [
+                    'div[class*="description" i]',
+                    'div[class*="snippet" i]',
+                    'p[class*="description" i]',
+                    'div[class*="summary" i]',
+                    'div[class*="preview" i]',
+                    'p',  # Any paragraph
+                ])
+                
+                # If selector-based extraction didn't find metadata, use aggressive pattern-based extraction
+                if not company or not location or not salary or not date_posted or not job_type or not description_text:
+                    fallback = extract_metadata_from_container(parent)
+                    if not company:
+                        company = fallback['company']
+                    if not location:
+                        location = fallback['location']
+                    if not salary:
+                        salary = fallback['salary']
+                    if not date_posted:
+                        date_posted = fallback['date_posted']
+                    if not job_type:
+                        job_type = fallback['job_type']
+                    if not description_text:
+                        description_text = fallback['description_text']
             
             jobs.append({
                 'job_title': title,
@@ -385,7 +514,7 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
                 'date_posted': date_posted,
                 'job_type': job_type,
                 'job_url': abs_url,
-                'description_text': None,
+                'description_text': description_text,
                 'description_html': None,
                 'salary': salary,
             })
