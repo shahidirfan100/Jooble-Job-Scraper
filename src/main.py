@@ -25,6 +25,9 @@ DEFAULT_MAX_PAGES = 1
 DEFAULT_MAX_JOBS = 0
 CLOUDFLARE_CHALLENGE_TIMEOUT = 45000  # 45 seconds for CF challenge
 TURNSTILE_CHALLENGE_TIMEOUT = 40000  # 40 seconds for Turnstile
+DETAIL_FETCH_TIMEOUT = 35000
+DETAIL_MAX_ATTEMPTS = 2
+DETAIL_CONCURRENCY = 3
 
 # --- Helper Functions ---
 
@@ -233,6 +236,190 @@ def select_first_text(container: Tag, selectors: List[str]) -> Optional[str]:
     return None
 
 
+def is_internal_detail_url(job_url: Optional[str]) -> bool:
+    """Return True if URL points to a Jooble-hosted detail page (not external redirect)."""
+    if not job_url:
+        return False
+    parsed = urlparse(job_url)
+    if not parsed.netloc:
+        return False
+    hostname = parsed.netloc.lower()
+    path = (parsed.path or '').lower()
+    if 'jooble' not in hostname:
+        return False
+    if '/redirect' in path or '/out/' in path:
+        return False
+    return True
+
+
+def merge_detail_fields(base_item: Dict[str, Any], detail_data: Dict[str, Any]) -> None:
+    """Merge parsed detail data back into the base job item."""
+    if not detail_data:
+        return
+
+    for key in ['job_title', 'company', 'location', 'date_posted', 'job_type', 'salary', 'job_url']:
+        value = detail_data.get(key)
+        if value:
+            base_item[key] = value
+
+    description_text = detail_data.get('description_text')
+    if description_text:
+        base_item['description_text'] = description_text
+
+    description_html = detail_data.get('description_html')
+    if description_html:
+        base_item['description_html'] = description_html
+
+
+def parse_detail_page(html: str) -> Dict[str, Optional[str]]:
+    """Parse a job detail page and extract additional metadata."""
+    soup = BeautifulSoup(html, 'lxml')
+    detail: Dict[str, Optional[str]] = {}
+
+    # JSON-LD often carries the cleanest data - prefer it if present
+    ld_jobs = extract_jobs_from_ld_json(soup)
+    if ld_jobs:
+        ld_job = ld_jobs[0]
+        for key in ['job_title', 'company', 'location', 'date_posted', 'job_type', 'salary', 'job_url', 'description_text']:
+            value = ld_job.get(key)
+            if value:
+                detail[key] = value
+
+    # Description containers on Jooble detail pages
+    description_selectors = [
+        '[data-test-name="job-description"]',
+        '[itemprop="description"]',
+        'div[id*="description" i]',
+        'section[id*="description" i]',
+        'article[id*="description" i]',
+        'div[class*="description" i]',
+    ]
+    for selector in description_selectors:
+        elem = soup.select_one(selector)
+        if elem:
+            detail['description_html'] = str(elem)
+            detail['description_text'] = elem.get_text(' ', strip=True)
+            break
+
+    supplemental_fields = {
+        'company': [
+            '[data-test-name="job-company"]',
+            'span[class*="company" i]',
+            'div[class*="company" i]',
+            '[itemprop="hiringOrganization"]',
+        ],
+        'location': [
+            '[data-test-name="job-location"]',
+            'span[class*="location" i]',
+            'div[class*="location" i]',
+            '[itemprop="jobLocation"]',
+        ],
+        'salary': [
+            '[data-test-name="job-salary"]',
+            'span[class*="salary" i]',
+            'div[class*="salary" i]',
+            '[itemprop="baseSalary"]',
+        ],
+        'job_type': [
+            '[data-test-name="job-type"]',
+            'span[class*="employment" i]',
+            'div[class*="employment" i]',
+        ],
+        'date_posted': [
+            '[data-test-name="job-date"]',
+            'time[datetime]',
+            'span[class*="posted" i]',
+        ],
+    }
+
+    for field, selectors in supplemental_fields.items():
+        if detail.get(field):
+            continue
+        value = select_first_text(soup, selectors)
+        if value:
+            detail[field] = value
+
+    # Canonical URL (used if JSON-LD missing job_url)
+    if not detail.get('job_url'):
+        canonical = soup.find('link', rel='canonical')
+        canonical_href = canonical.get('href') if canonical else None
+        if canonical_href:
+            detail['job_url'] = canonical_href
+
+    return detail
+
+
+async def fetch_job_detail_html(context, job_url: str, referer: Optional[str] = None, label: str = '') -> Optional[str]:
+    """Fetch a job detail page using a lightweight Playwright page."""
+    for attempt in range(1, DETAIL_MAX_ATTEMPTS + 1):
+        page: Optional[Page] = None
+        try:
+            page = await context.new_page()
+            headers = {
+                'User-Agent': get_random_user_agent(),
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+            if referer:
+                headers['Referer'] = referer
+            await page.set_extra_http_headers(headers)
+            await simulate_connection_warmup(page)
+            Actor.log.debug(f'Fetching detail page (attempt {attempt}/{DETAIL_MAX_ATTEMPTS}) {label} -> {job_url}')
+            response = await page.goto(job_url, wait_until='domcontentloaded', timeout=DETAIL_FETCH_TIMEOUT)
+            status = response.status if response else 'no-response'
+            if response and response.status == 200:
+                await asyncio.sleep(human_like_delay(0.4, 1.2))
+                html = await page.content()
+                return html
+            Actor.log.debug(f'Detail page status {status} for {job_url}')
+        except Exception as e:
+            Actor.log.debug(f'Detail fetch error for {job_url}: {e}')
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        backoff = exponential_backoff_with_jitter(attempt, base_delay=1.5, max_delay=8.0)
+        await asyncio.sleep(backoff)
+    return None
+
+
+async def enrich_jobs_with_details(context, job_items: List[Dict[str, Any]], referer: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Fetch and merge detail-page data for each job item."""
+    if not job_items or context is None:
+        return job_items
+
+    semaphore = asyncio.Semaphore(DETAIL_CONCURRENCY)
+    results: List[Optional[Dict[str, Any]]] = [None] * len(job_items)
+
+    async def _enrich(idx: int, item: Dict[str, Any]) -> None:
+        try:
+            job_url = item.get('job_url')
+            if not is_internal_detail_url(job_url):
+                results[idx] = item
+                return
+
+            async with semaphore:
+                html = await fetch_job_detail_html(context, job_url, referer=referer, label=f'job#{idx + 1}')
+
+            if not html:
+                results[idx] = item
+                return
+
+            detail_data = parse_detail_page(html)
+            if detail_data:
+                merge_detail_fields(item, detail_data)
+
+            results[idx] = item
+        except Exception as e:
+            Actor.log.debug(f'Error enriching job detail for {item.get("job_url")}: {e}')
+            results[idx] = item
+
+    await asyncio.gather(*[asyncio.create_task(_enrich(idx, item)) for idx, item in enumerate(job_items)])
+    # results list preserves input order
+    return [res if res is not None else job_items[idx] for idx, res in enumerate(results)]
+
+
 
 
 # --- Job Extraction Functions ---
@@ -327,9 +514,9 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
     
     # Jooble uses specific link patterns - ordered by reliability
     link_selectors = [
-        'a[href*="/redirect?"]',  # PRIMARY: Most common Jooble redirect pattern
-        'a[href*="/job/"]',       # SECONDARY: Direct job links
-        'a[href*="/jdp/"]',       # TERTIARY: Job detail page links
+        'a[href*="/jdp/"]',       # PRIMARY: Job detail pages
+        'a[href*="/job/"]',       # SECONDARY: Alternate detail pattern
+        'a[href*="/redirect?"]',  # TERTIARY: External redirect (fallback only)
         'a.job_card_link',        # FALLBACK: CSS class based
     ]
     
@@ -341,12 +528,16 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
                 continue
             
             abs_url = absolute_url(page_url, href)
-            if abs_url in seen_urls:
-                continue
-            seen_urls.add(abs_url)
             
+            # Get immediate job container (needed for metadata + better title fallback)
+            container = link.find_parent(['div', 'article', 'li', 'tr', 'section'])
+
             # Get title from link text - strip whitespace and validate
             title = link.get_text(strip=True)
+            if (not title or len(title) < 2) and container:
+                title_elem = container.select_one('a[href*="/jdp/"], a[href*="/job/"], h2, h3')
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
             if not title or len(title) < 2:
                 continue
             
@@ -361,11 +552,15 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
             date_posted = None
             job_type = None
             description_text = None
-            
-            # Get immediate job container
-            container = link.find_parent(['div', 'article', 'li', 'tr', 'section'])
-            
+
+            job_url = abs_url
+
             if container:
+                # Prefer detail page URL if present within the container
+                detail_link = container.select_one('a[href*="/jdp/"], a[href*="/job/"]')
+                if detail_link and detail_link.get('href'):
+                    job_url = absolute_url(page_url, detail_link.get('href'))
+
                 # Extract metadata ONLY from clearly-marked elements
                 
                 # Company: Only from elements with "company" in class name
@@ -410,6 +605,10 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
                     description_text = desc_elem.get_text(strip=True)
                     if description_text and len(description_text) > 500:
                         description_text = description_text[:500]  # Truncate if too long
+            canonical_job_url = job_url or abs_url
+            if canonical_job_url in seen_urls:
+                continue
+            seen_urls.add(canonical_job_url)
             
             jobs.append({
                 'job_title': title,
@@ -417,7 +616,7 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
                 'location': location,
                 'date_posted': date_posted,
                 'job_type': job_type,
-                'job_url': abs_url,
+                'job_url': canonical_job_url,
                 'description_text': description_text,
                 'description_html': None,
                 'salary': salary,
@@ -474,7 +673,8 @@ def parse_job_block(block: Tag, page_url: str) -> Optional[Dict[str, Any]]:
         if not link:
             return None
         
-        href = link.get('href')
+        detail_link = block.select_one('a[href*="/jdp/"], a[href*="/job/"]')
+        href = (detail_link.get('href') if detail_link and detail_link.get('href') else link.get('href'))
         if not href or not any(p in href for p in ['/redirect', '/job/', '/jdp/']):
             return None
         
@@ -974,9 +1174,10 @@ async def main() -> None:
                     soup = BeautifulSoup(html, 'lxml')
                     session_page_count += 1
 
-                    # Extract jobs using optimized approach (priority: links → blocks → JSON-LD)
+                    # Extract jobs using optimized approach (priority: links -> blocks -> JSON-LD)
                     try:
-                        new_items_on_page = 0
+                        extracted_count = 0
+                        page_items: List[Dict[str, Any]] = []
                         
                         # PRIMARY: Direct link extraction (most reliable on Jooble)
                         try:
@@ -991,16 +1192,15 @@ async def main() -> None:
                                 
                                 item['source_url'] = url
                                 item['page_number'] = page_num
-                                await Actor.push_data(item)
-                                total_pushed += 1
-                                new_items_on_page += 1
+                                page_items.append(item)
+                                extracted_count += 1
                                 if job_url:
                                     seen_urls.add(job_url)
                         except Exception as e:
                             Actor.log.debug(f'Error in direct link extraction: {e}')
 
                         # SECONDARY: Try job blocks if links didn't work well
-                        if new_items_on_page < 5:
+                        if extracted_count < 5:
                             try:
                                 Actor.log.debug('Direct links insufficient, trying job blocks (SECONDARY)...')
                                 blocks = extract_job_blocks(soup)
@@ -1017,9 +1217,8 @@ async def main() -> None:
 
                                             item['source_url'] = url
                                             item['page_number'] = page_num
-                                            await Actor.push_data(item)
-                                            total_pushed += 1
-                                            new_items_on_page += 1
+                                            page_items.append(item)
+                                            extracted_count += 1
                                             if job_url:
                                                 seen_urls.add(job_url)
                                         except Exception as e:
@@ -1029,7 +1228,7 @@ async def main() -> None:
                                 Actor.log.debug(f'Error in job block extraction: {e}')
 
                         # TERTIARY: Try JSON-LD if very few jobs found
-                        if new_items_on_page < 3:
+                        if extracted_count < 3:
                             try:
                                 Actor.log.debug('Jobs still low, trying JSON-LD extraction (TERTIARY)...')
                                 ld_jobs = extract_jobs_from_ld_json(soup)
@@ -1041,19 +1240,36 @@ async def main() -> None:
                                             continue
                                         item['source_url'] = url
                                         item['page_number'] = page_num
-                                        await Actor.push_data(item)
-                                        total_pushed += 1
-                                        new_items_on_page += 1
+                                        page_items.append(item)
+                                        extracted_count += 1
                                         if job_url:
                                             seen_urls.add(job_url)
                             except Exception as e:
                                 Actor.log.debug(f'Error in JSON-LD extraction: {e}')
 
-                        Actor.log.info(f'Page {page_num}: pushed {new_items_on_page} new items (total {total_pushed}).')
-
-                        if new_items_on_page == 0:
+                        if not page_items:
                             Actor.log.info('No jobs found on this page, continuing to next page...')
-                            # Don't break, continue to next page
+                            continue
+
+                        try:
+                            enriched_items = await enrich_jobs_with_details(context, page_items, referer=url)
+                        except Exception as e:
+                            Actor.log.debug(f'Detail enrichment failed, pushing raw items: {e}')
+                            enriched_items = page_items
+
+                        pushed_this_page = 0
+                        for item in enriched_items:
+                            await Actor.push_data(item)
+                            total_pushed += 1
+                            pushed_this_page += 1
+                            if max_jobs > 0 and total_pushed >= max_jobs:
+                                break
+
+                        Actor.log.info(f'Page {page_num}: pushed {pushed_this_page} new items (total {total_pushed}).')
+
+                        if max_jobs > 0 and total_pushed >= max_jobs:
+                            Actor.log.info(f'Reached maxJobs limit ({max_jobs}). Stopping.')
+                            break
 
                     except Exception as e:
                         Actor.log.warning(f'Error processing page {page_num}: {e}')
