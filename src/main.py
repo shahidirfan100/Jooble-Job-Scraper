@@ -310,22 +310,23 @@ def parse_json_ld_job(data: dict) -> Optional[Dict[str, Any]]:
 
 
 def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str, Any]]:
-    """Extract jobs by finding job links directly (fallback method)."""
+    """Extract jobs by finding job links directly (PRIMARY method - most reliable)."""
     jobs = []
     seen_urls = set()
     
-    # Jooble uses specific link patterns
+    # Jooble uses specific link patterns - ordered by reliability
     link_selectors = [
-        'a.job_card_link',
-        'a[href*="/redirect?"]',
-        'a[href*="/job/"]',
-        'a[href*="/jdp/"]',
+        'a[href*="/redirect?"]',  # PRIMARY: Most common Jooble redirect pattern
+        'a[href*="/job/"]',       # SECONDARY: Direct job links
+        'a[href*="/jdp/"]',       # TERTIARY: Job detail page links
+        'a.job_card_link',        # FALLBACK: CSS class based
     ]
     
     for selector in link_selectors:
+        found_on_selector = 0
         for link in soup.select(selector):
             href = link.get('href')
-            if not href:
+            if not href or len(href) < 5:
                 continue
             
             abs_url = absolute_url(page_url, href)
@@ -333,42 +334,67 @@ def extract_jobs_from_links(soup: BeautifulSoup, page_url: str) -> List[Dict[str
                 continue
             seen_urls.add(abs_url)
             
-            # Get title from link text
+            # Get title from link text - strip whitespace and validate
             title = link.get_text(strip=True)
-            if not title or len(title) < 3:
+            if not title or len(title) < 2:
+                continue
+            
+            # Skip navigation links
+            if any(x in title.lower() for x in ['next', 'prev', 'all jobs', 'home', 'about']):
                 continue
             
             # Try to find additional info from parent container
-            parent = link.find_parent(['div', 'article', 'li'])
+            parent = link.find_parent(['div', 'article', 'li', 'section'])
             company = None
             location = None
             salary = None
+            date_posted = None
+            job_type = None
             
             if parent:
                 company = select_first_text(parent, [
                     'span[class*="company" i]',
                     'div[class*="company" i]',
+                    'a[class*="company" i]',
                 ])
                 location = select_first_text(parent, [
                     'span[class*="location" i]',
                     'div[class*="location" i]',
+                    'span[class*="city" i]',
                 ])
                 salary = select_first_text(parent, [
                     'span[class*="salary" i]',
                     'div[class*="salary" i]',
+                    'span[class*="wage" i]',
+                ])
+                date_posted = select_first_text(parent, [
+                    'span[class*="date" i]',
+                    'time',
+                    'span[class*="posted" i]',
+                ])
+                job_type = select_first_text(parent, [
+                    'span[class*="type" i]',
+                    'span[class*="schedule" i]',
+                    'span[class*="employment" i]',
                 ])
             
             jobs.append({
                 'job_title': title,
                 'company': company,
                 'location': location,
-                'date_posted': None,
-                'job_type': None,
+                'date_posted': date_posted,
+                'job_type': job_type,
                 'job_url': abs_url,
                 'description_text': None,
                 'description_html': None,
                 'salary': salary,
             })
+            found_on_selector += 1
+        
+        # If we found jobs with this selector, don't try others
+        if found_on_selector > 0:
+            Actor.log.debug(f'Link selector "{selector}" found {found_on_selector} jobs')
+            break
     
     return jobs
 
@@ -915,24 +941,21 @@ async def main() -> None:
                     soup = BeautifulSoup(html, 'lxml')
                     session_page_count += 1
 
-                    # Extract jobs using hybrid approach with error handling
+                    # Extract jobs using optimized approach (priority: links → blocks → JSON-LD)
                     try:
-                        blocks = extract_job_blocks(soup)
-                        Actor.log.info(f'Found {len(blocks)} job blocks on page {page_num}')
-
                         new_items_on_page = 0
-
-                        # Try parsing job blocks first
-                        for block in blocks:
-                            try:
-                                item = parse_job_block(block, page_url=url)
-                                if not item:
-                                    continue
+                        
+                        # PRIMARY: Direct link extraction (most reliable on Jooble)
+                        try:
+                            Actor.log.info('Attempting direct link extraction (PRIMARY method)...')
+                            link_jobs = extract_jobs_from_links(soup, page_url=url)
+                            Actor.log.info(f'Direct link extraction found {len(link_jobs)} jobs')
+                            
+                            for item in link_jobs:
                                 job_url = item.get('job_url')
                                 if job_url and job_url in seen_urls:
                                     continue
-
-                                # Enrich with metadata
+                                
                                 item['source_url'] = url
                                 item['page_number'] = page_num
                                 await Actor.push_data(item)
@@ -940,47 +963,58 @@ async def main() -> None:
                                 new_items_on_page += 1
                                 if job_url:
                                     seen_urls.add(job_url)
-                            except Exception as e:
-                                Actor.log.debug(f'Error parsing job block: {e}')
-                                continue
+                        except Exception as e:
+                            Actor.log.debug(f'Error in direct link extraction: {e}')
 
-                        # Fallback: Try JSON-LD if no blocks found
-                        if new_items_on_page == 0:
+                        # SECONDARY: Try job blocks if links didn't work well
+                        if new_items_on_page < 5:
                             try:
-                                Actor.log.info('No jobs from blocks, trying JSON-LD extraction')
+                                Actor.log.debug('Direct links insufficient, trying job blocks (SECONDARY)...')
+                                blocks = extract_job_blocks(soup)
+                                if blocks:
+                                    Actor.log.debug(f'Found {len(blocks)} job blocks')
+                                    for block in blocks:
+                                        try:
+                                            item = parse_job_block(block, page_url=url)
+                                            if not item:
+                                                continue
+                                            job_url = item.get('job_url')
+                                            if job_url and job_url in seen_urls:
+                                                continue
+
+                                            item['source_url'] = url
+                                            item['page_number'] = page_num
+                                            await Actor.push_data(item)
+                                            total_pushed += 1
+                                            new_items_on_page += 1
+                                            if job_url:
+                                                seen_urls.add(job_url)
+                                        except Exception as e:
+                                            Actor.log.debug(f'Error parsing job block: {e}')
+                                            continue
+                            except Exception as e:
+                                Actor.log.debug(f'Error in job block extraction: {e}')
+
+                        # TERTIARY: Try JSON-LD if very few jobs found
+                        if new_items_on_page < 3:
+                            try:
+                                Actor.log.debug('Jobs still low, trying JSON-LD extraction (TERTIARY)...')
                                 ld_jobs = extract_jobs_from_ld_json(soup)
-                                for item in ld_jobs:
-                                    job_url = item.get('job_url')
-                                    if job_url and job_url in seen_urls:
-                                        continue
-                                    item['source_url'] = url
-                                    item['page_number'] = page_num
-                                    await Actor.push_data(item)
-                                    total_pushed += 1
-                                    new_items_on_page += 1
-                                    if job_url:
-                                        seen_urls.add(job_url)
+                                if ld_jobs:
+                                    Actor.log.debug(f'JSON-LD found {len(ld_jobs)} jobs')
+                                    for item in ld_jobs:
+                                        job_url = item.get('job_url')
+                                        if job_url and job_url in seen_urls:
+                                            continue
+                                        item['source_url'] = url
+                                        item['page_number'] = page_num
+                                        await Actor.push_data(item)
+                                        total_pushed += 1
+                                        new_items_on_page += 1
+                                        if job_url:
+                                            seen_urls.add(job_url)
                             except Exception as e:
-                                Actor.log.debug(f'Error extracting JSON-LD jobs: {e}')
-
-                        # Last resort: Direct link extraction
-                        if new_items_on_page == 0:
-                            try:
-                                Actor.log.info('No jobs from JSON-LD, trying direct link extraction')
-                                link_jobs = extract_jobs_from_links(soup, page_url=url)
-                                for item in link_jobs:
-                                    job_url = item.get('job_url')
-                                    if job_url and job_url in seen_urls:
-                                        continue
-                                    item['source_url'] = url
-                                    item['page_number'] = page_num
-                                    await Actor.push_data(item)
-                                    total_pushed += 1
-                                    new_items_on_page += 1
-                                    if job_url:
-                                        seen_urls.add(job_url)
-                            except Exception as e:
-                                Actor.log.debug(f'Error extracting link jobs: {e}')
+                                Actor.log.debug(f'Error in JSON-LD extraction: {e}')
 
                         Actor.log.info(f'Page {page_num}: pushed {new_items_on_page} new items (total {total_pushed}).')
 
