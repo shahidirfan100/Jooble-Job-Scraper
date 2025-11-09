@@ -23,6 +23,8 @@ MAX_BACKOFF_DELAY = 60.0
 FETCH_MAX_BACKOFF_DELAY = 30.0  # Shorter delay for page fetches
 DEFAULT_MAX_PAGES = 1
 DEFAULT_MAX_JOBS = 0
+CLOUDFLARE_CHALLENGE_TIMEOUT = 45000  # 45 seconds for CF challenge
+TURNSTILE_CHALLENGE_TIMEOUT = 40000  # 40 seconds for Turnstile
 
 # --- Helper Functions ---
 
@@ -162,12 +164,12 @@ async def create_stealth_context(browser):
         timezone_id=random.choice(['America/New_York', 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo']),
         java_script_enabled=True,
         accept_downloads=False,
-        bypass_csp=True,
+        bypass_csp=False,  # CHANGED: Don't bypass CSP - can trigger bot detection
         ignore_https_errors=True,
         # Randomize other properties
         device_scale_factor=random.choice([1, 1.25, 1.5]),
-        is_mobile=random.random() < 0.1,  # 10% mobile
-        has_touch=random.random() < 0.15,  # 15% touch
+        is_mobile=random.random() < 0.05,  # 5% mobile (reduced from 10%)
+        has_touch=random.random() < 0.05,  # 5% touch (reduced from 15%)
         # Enhanced stealth options
         permissions=[],  # Block all permissions
         geolocation=None,  # No geolocation
@@ -176,83 +178,28 @@ async def create_stealth_context(browser):
         forced_colors=None,  # No forced colors
     )
 
-    # Enhanced stealth script injection
+    # Streamlined stealth script - avoid aggressive anti-detection
     await context.add_init_script("""
-        // Remove webdriver property
+        // Remove webdriver property (essential)
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
         });
 
-        // Mock plugins array with realistic values
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                { name: 'Chrome PDF Plugin', description: 'Portable Document Format', filename: 'internal-pdf-viewer' },
-                { name: 'Chrome PDF Viewer', description: '', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                { name: 'Native Client', description: '', filename: 'internal-nacl-plugin' }
-            ]
-        });
-
-        // Mock languages with slight variations
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-
-        // Enhanced chrome object
+        // Mock chrome object (essential for Chrome detection)
         window.chrome = {
-            runtime: {
-                onConnect: undefined,
-                onMessage: undefined,
-                connect: function() { return {}; },
-                sendMessage: function() { return {}; }
-            },
-            csi: function() { return {}; },
-            loadTimes: function() { return {}; },
-            app: {
-                isInstalled: false
-            }
+            runtime: {}
         };
 
-        // Mock permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-
-        // Mock hardware concurrency with variation
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 4 + Math.floor(Math.random() * 8)  // Random between 4-12
+        // Mock plugins (minimal, real browsers don't expose full list)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3]  // Just return array with items
         });
 
-        // Mock device memory
-        Object.defineProperty(navigator, 'deviceMemory', {
-            get: () => [4, 8, 16][Math.floor(Math.random() * 3)]
-        });
-
-        // Remove automation indicators
+        // Remove obvious bot signatures
         delete window.callPhantom;
         delete window._phantom;
         delete window.__nightmare;
         delete window._seleniumRunner;
-        delete window.__webdriver_script_fn;
-        delete window.__driver_evaluate;
-        delete window.__webdriver_evaluate;
-        delete window.__selenium_evaluate;
-        delete window.__fxdriver_evaluate;
-        delete window.__driver_unwrapped;
-        delete window.__selenium_unwrapped;
-        delete window.__fxdriver_unwrapped;
-
-        // Mock battery API
-        if (!navigator.getBattery) {
-            navigator.getBattery = () => Promise.resolve({
-                charging: Math.random() > 0.3,  // 70% chance charging
-                chargingTime: Math.random() * 3600,
-                dischargingTime: Math.random() * 7200,
-                level: 0.1 + Math.random() * 0.9  // 10-100%
-            });
-        }
     """)
 
     return context
@@ -542,8 +489,8 @@ def parse_job_block(block: Tag, page_url: str) -> Optional[Dict[str, Any]]:
 async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None, page_num: Optional[int] = None) -> Optional[str]:
     """Fetch the HTML content of a search page using Playwright with retries and diagnostics.
 
-    This function will try multiple attempts with exponential backoff, rotate user-agents,
-    and on final failure save a screenshot and HTML snippet to Key-Value store for debugging.
+    This function handles Cloudflare challenges, retries with exponential backoff,
+    rotates user-agents, and saves diagnostics on final failure.
     """
     max_attempts = MAX_RETRY_ATTEMPTS
     base_delay = BASE_RETRY_DELAY
@@ -571,7 +518,14 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
             await simulate_connection_warmup(page)
 
             Actor.log.info(f'Attempt {attempt}/{max_attempts} fetching {url} with UA: {ua[:60]}')
-            response = await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            
+            # Disable request interception to avoid blocking resources
+            try:
+                await page.route('**/*', lambda route: route.continue_())
+            except Exception:
+                pass
+            
+            response = await page.goto(url, wait_until='domcontentloaded', timeout=40000)
 
             if not response:
                 Actor.log.warning(f'No response object on attempt {attempt} for {url}')
@@ -580,27 +534,66 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
             status = response.status
             Actor.log.debug(f'Navigation response status: {status} for {url}')
 
-            if status == 403 or status == 429:
+            # Handle Cloudflare challenges
+            if status in [403, 429]:
                 Actor.log.warning(f'Blocked or rate-limited (status {status}) on attempt {attempt} for {url}')
-                # If last attempt, capture diagnostics
-                if attempt == max_attempts:
-                    try:
-                        key = f'fail_screenshot_page_{page_num or "na"}_attempt_{attempt}.png'
-                        screenshot = await page.screenshot(full_page=False)
-                        await Actor.set_value(key, screenshot, content_type='image/png')
-                        html_snip = await page.content()
-                        await Actor.set_value(f'fail_html_page_{page_num or "na"}_attempt_{attempt}.html', html_snip[:10000], content_type='text/html')
-                    except Exception as e:
-                        Actor.log.debug(f'Failed to save diagnostics: {e}')
-                # Smart backoff based on status
-                if status == 429:
-                    # Rate limited - longer backoff
-                    backoff_delay = exponential_backoff_with_jitter(attempt, base_delay * 2, max_delay=60)
-                else:
-                    # Blocked - standard backoff
-                    backoff_delay = exponential_backoff_with_jitter(attempt, base_delay, max_delay=FETCH_MAX_BACKOFF_DELAY)
-                await asyncio.sleep(backoff_delay)
-                continue
+                
+                # Try to wait for Cloudflare challenge resolution
+                try:
+                    # Check if Cloudflare challenge is present
+                    cf_present = await page.query_selector('[data-sitekey], #challenge-form, .cf-challenge')
+                    if cf_present:
+                        Actor.log.info(f'Cloudflare/Turnstile challenge detected, waiting for resolution...')
+                        try:
+                            # Wait for either challenge to complete OR challenge to disappear
+                            await page.wait_for_function(
+                                '''() => {
+                                    const challenge = document.querySelector('[data-sitekey], #challenge-form, .cf-challenge');
+                                    if (!challenge) return true;
+                                    const frame = document.querySelector('iframe[src*="turnstile"]');
+                                    return !frame;
+                                }''',
+                                timeout=TURNSTILE_CHALLENGE_TIMEOUT
+                            )
+                            Actor.log.info('Challenge resolved, checking page content...')
+                            
+                            # Check if we got past the challenge
+                            new_response = await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                            if new_response and new_response.status == 200:
+                                Actor.log.info('Successfully bypassed challenge!')
+                                status = 200
+                            else:
+                                Actor.log.warning(f'After challenge: status {new_response.status if new_response else "none"}')
+                                raise RuntimeError('Challenge passed but still blocked')
+                        except Exception as e:
+                            Actor.log.warning(f'Challenge wait timed out or failed: {e}')
+                            raise
+                except Exception as e:
+                    Actor.log.debug(f'Challenge handling error: {e}')
+                
+                if status != 200:
+                    # Save diagnostics
+                    if attempt == max_attempts:
+                        try:
+                            key = f'fail_screenshot_page_{page_num or "na"}_attempt_{attempt}.png'
+                            screenshot = await page.screenshot(full_page=False)
+                            await Actor.set_value(key, screenshot, content_type='image/png')
+                            html_snip = await page.content()
+                            await Actor.set_value(f'fail_html_page_{page_num or "na"}_attempt_{attempt}.html', html_snip[:10000], content_type='text/html')
+                        except Exception as e:
+                            Actor.log.debug(f'Failed to save diagnostics: {e}')
+                    
+                    # Smart backoff based on status
+                    if status == 429:
+                        # Rate limited - longer backoff
+                        backoff_delay = exponential_backoff_with_jitter(attempt, base_delay * 3, max_delay=120)
+                    else:
+                        # Blocked - standard backoff
+                        backoff_delay = exponential_backoff_with_jitter(attempt, base_delay * 2, max_delay=FETCH_MAX_BACKOFF_DELAY)
+                    
+                    Actor.log.warning(f'Backing off for {backoff_delay:.1f}s before retry...')
+                    await asyncio.sleep(backoff_delay)
+                    continue
 
             if status >= 400:
                 Actor.log.warning(f'HTTP error {status} for {url} on attempt {attempt}')
@@ -620,7 +613,7 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
 
             # Wait for job listing elements (best-effort)
             try:
-                await page.wait_for_selector('article, a[href*="/redirect"], div[class*="job"]', timeout=12000)
+                await page.wait_for_selector('article, a[href*="/redirect"], div[class*="job"]', timeout=10000)
             except Exception as e:
                 Actor.log.debug(f'Wait for selector timed out: {e}')
 
@@ -633,39 +626,23 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
                 await page.mouse.move(mouse_x, mouse_y)
 
                 # Simulate reading time before scrolling
-                await asyncio.sleep(human_like_delay(2.0, 5.0))
-
-                # Natural scrolling pattern
-                scroll_steps = random.randint(2, 5)
-                for i in range(scroll_steps):
-                    scroll_amount = random.randint(200, 600)
-                    await page.evaluate(f"window.scrollBy(0, {scroll_amount});")
-                    await asyncio.sleep(human_like_delay(0.5, 2.0))
-
-                # Simulate more reading time
                 await asyncio.sleep(human_like_delay(1.0, 3.0))
 
-                # Random additional interactions
-                if random.random() < 0.3:  # 30% chance
-                    # Simulate hovering over a job listing
-                    try:
-                        job_elements = await page.query_selector_all('article, div[class*="job"]')
-                        if job_elements:
-                            random_job = random.choice(job_elements[:5])  # First 5 jobs
-                            box = await random_job.bounding_box()
-                            if box:
-                                await page.mouse.move(
-                                    box['x'] + box['width'] / 2,
-                                    box['y'] + box['height'] / 2
-                                )
-                                await asyncio.sleep(human_like_delay(0.5, 1.5))
-                    except Exception:
-                        pass
+                # Natural scrolling pattern (reduced)
+                scroll_steps = random.randint(1, 3)
+                for i in range(scroll_steps):
+                    scroll_amount = random.randint(200, 400)
+                    await page.evaluate(f"window.scrollBy(0, {scroll_amount});")
+                    await asyncio.sleep(human_like_delay(0.3, 1.0))
+
+                # Simulate reading time
+                await asyncio.sleep(human_like_delay(0.5, 2.0))
+
             except Exception as e:
                 Actor.log.debug(f'Error during browsing simulation: {e}')
 
-            # Final small delay to allow async content
-            await asyncio.sleep(human_like_delay(1.0, 2.5))
+            # Final small delay
+            await asyncio.sleep(human_like_delay(0.5, 1.5))
 
             html = await page.content()
             Actor.log.info(f'Successfully fetched {url} (len={len(html)}) on attempt {attempt}')
@@ -687,6 +664,7 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
             # Exponential backoff before retrying with jitter
             backoff_delay = exponential_backoff_with_jitter(attempt, base_delay, max_delay=15)
             await asyncio.sleep(backoff_delay)
+    
     return None
 
 
@@ -752,41 +730,24 @@ async def main() -> None:
 
         # Launch Playwright browser with stealth
         async with async_playwright() as p:
-            # Configure browser launch options with balanced stealth
+            # Configure browser launch options - BALANCED approach
+            # Avoid overly aggressive flags that trigger detection
             launch_options = {
                 'headless': True,  # Run headless for server environment
                 'args': [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
                     '--no-first-run',
                     '--no-zygote',
-                    '--disable-gpu',
                     '--disable-web-security',
-                    '--disable-features=VizDisplayCompositor',
                     '--disable-blink-features=AutomationControlled',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--disable-field-trial-config',
-                    '--disable-hang-monitor',
-                    '--disable-prompt-on-repost',
-                    '--disable-infobars',
-                    '--disable-extensions',
-                    '--no-default-browser-check',
-                    '--mute-audio',
-                    '--disable-sync',
-                    '--disable-translate',
-                    '--hide-scrollbars',
-                    '--metrics-recording-only',
-                    '--no-crash-upload',
-                    '--disable-logging',
-                    '--disable-login-animations',
-                    '--disable-notifications',
-                    '--disable-component-update',
-                    # Keep user agent override but not too restrictive
-                    '--user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"',
+                    # Removed overly aggressive flags:
+                    # - disable-gpu (can trigger bot detection)
+                    # - disable-accelerated-2d-canvas (looks like bot)
+                    # - disable-extensions (unnecessary, raises suspicion)
+                    # - hide-scrollbars (obvious bot behavior)
+                    # Keep minimal flags to blend in
                 ]
             }
             
@@ -869,55 +830,10 @@ async def main() -> None:
                 'Cache-Control': 'max-age=0',
             })
 
-            # Quick connectivity health checks (non-blocking)
-            try:
-                health = await page.goto('https://example.com', wait_until='domcontentloaded', timeout=20000)
-                Actor.log.info(f'Health check example.com status: {health.status if health else "no-response"}')
-            except Exception as e:
-                Actor.log.warning(f'Health check example.com failed: {e}')
-
-            try:
-                jooble_health = await page.goto('https://jooble.org', wait_until='domcontentloaded', timeout=30000)
-                Actor.log.info(f'Jooble root status: {jooble_health.status if jooble_health else "no-response"}')
-                if jooble_health and jooble_health.status == 200:
-                    try:
-                        txt = await jooble_health.text()
-                        await Actor.set_value('jooble_root_snippet', txt[:2000], content_type='text/plain')
-                    except Exception:
-                        pass
-                elif jooble_health and jooble_health.status == 403:
-                    Actor.log.warning('Jooble returned 403 on health check - this may indicate blocking, but continuing...')
-            except Exception as e:
-                Actor.log.warning(f'Jooble health check failed: {e}')
-
-            # If proxy was configured but health checks are failing, try without proxy
-            if proxy_configured and (not health or health.status != 200):
-                Actor.log.warning('Proxy may be causing connectivity issues, attempting to continue without proxy...')
-                try:
-                    # Create new browser context without proxy
-                    await context.close()
-                    context = await create_stealth_context(browser)
-                    page = await context.new_page()
-                    # Re-attach event handlers
-                    page.on('requestfailed', _on_request_failed)
-                    page.on('console', _on_console)
-                    page.on('response', _on_response)
-                    # Re-set headers
-                    await page.set_extra_http_headers({
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'Upgrade-Insecure-Requests': '1',
-                        'Sec-Fetch-Dest': 'document',
-                        'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-Site': 'none',
-                        'Sec-Fetch-User': '?1',
-                        'Cache-Control': 'max-age=0',
-                    })
-                    proxy_configured = False
-                    Actor.log.info('Switched to direct connection (no proxy)')
-                except Exception as e:
-                    Actor.log.error(f'Failed to create non-proxy context: {e}')
+            # Skip health checks or make them truly non-blocking
+            # Health checks can trigger bot detection and waste time
+            # Just proceed directly to scraping
+            Actor.log.info('Skipping health checks to avoid detection. Starting direct scraping...')
             
             try:
                 # Skip AJAX for now, as Playwright handles dynamic content
@@ -963,8 +879,37 @@ async def main() -> None:
 
                     html = await fetch_search_page(page, url, referer=referer, page_num=page_num)
                     referer_url = url  # Update for next iteration
+                    
+                    # If fetch failed and proxy is active, try without proxy
+                    if not html and proxy_configured:
+                        Actor.log.info(f'Fetch failed with proxy on page {page_num}, attempting without proxy...')
+                        try:
+                            await context.close()
+                            context = await create_stealth_context(browser)
+                            page = await context.new_page()
+                            page.on('requestfailed', _on_request_failed)
+                            page.on('console', _on_console)
+                            page.on('response', _on_response)
+                            await page.set_extra_http_headers({
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                                'Accept-Language': 'en-US,en;q=0.9',
+                                'Accept-Encoding': 'gzip, deflate, br',
+                                'Upgrade-Insecure-Requests': '1',
+                                'Sec-Fetch-Dest': 'document',
+                                'Sec-Fetch-Mode': 'navigate',
+                                'Sec-Fetch-Site': 'none',
+                                'Sec-Fetch-User': '?1',
+                                'Cache-Control': 'max-age=0',
+                            })
+                            proxy_configured = False
+                            Actor.log.info('Switched to direct connection (no proxy)')
+                            # Retry fetch without proxy
+                            html = await fetch_search_page(page, url, referer=referer, page_num=page_num)
+                        except Exception as e:
+                            Actor.log.error(f'Failed to switch to non-proxy context: {e}')
+                    
                     if not html:
-                        Actor.log.warning(f'Failed to fetch HTML for {url}, attempting to continue with next page...')
+                        Actor.log.warning(f'Failed to fetch HTML for {url} (all attempts), skipping page...')
                         continue  # Continue to next page instead of breaking
 
                     soup = BeautifulSoup(html, 'lxml')
