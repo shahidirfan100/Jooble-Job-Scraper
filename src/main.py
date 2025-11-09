@@ -19,14 +19,290 @@ from apify import Actor
 # --- Helper Functions ---
 
 def get_random_user_agent():
-    """Return a random realistic user agent."""
+    """Return a random realistic user agent with latest Chrome versions."""
     user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
     ]
     return random.choice(user_agents)
+
+
+def get_client_hints_for_ua(user_agent: str) -> Dict[str, str]:
+    """Generate client hint headers that match the user agent."""
+    # Extract platform and version from UA
+    is_mobile = '"Mobile"' in user_agent
+    is_windows = 'Windows NT' in user_agent
+    is_mac = 'Macintosh' in user_agent
+    is_linux = 'Linux' in user_agent
+
+    # Extract Chrome version
+    version_match = re.search(r'Chrome/(\d+)\.(\d+)\.(\d+)\.(\d+)', user_agent)
+    if version_match:
+        major, minor, build, patch = version_match.groups()
+        chrome_version = f'"{major}.{minor}.{build}.{patch}"'
+    else:
+        chrome_version = '"131.0.0.0"'  # fallback
+
+    headers = {
+        'Sec-CH-UA': f'"Chromium";v={major}, "Google Chrome";v={major}, "Not:A-Brand";v="99"',
+        'Sec-CH-UA-Mobile': '?1' if is_mobile else '?0',
+        'Sec-CH-UA-Platform': f'"{ "Windows" if is_windows else "macOS" if is_mac else "Linux" }"',
+    }
+
+    return headers
+
+
+def human_like_delay(min_seconds: float = 0.5, max_seconds: float = 3.0) -> float:
+    """Generate human-like delay with realistic distribution."""
+    # Use beta distribution for more realistic timing (peaks around 1-2 seconds)
+    import math
+    alpha, beta_param = 2.0, 2.0
+    u = random.random()
+    delay = min_seconds + (max_seconds - min_seconds) * (u ** (1/(alpha+beta_param-1)))
+    return delay
+
+
+def simulate_reading_time(text_length: int) -> float:
+    """Simulate reading time based on text length (words per minute)."""
+    if text_length <= 0:
+        return 0
+    words_per_minute = 200 + random.randint(-50, 50)  # 150-250 WPM
+    estimated_words = text_length / 5  # rough estimate
+    reading_time = (estimated_words / words_per_minute) * 60
+    # Add some jitter and minimum time
+    return max(0.5, reading_time * (0.8 + random.random() * 0.4))
+
+
+def simulate_mouse_movement(page: Page) -> None:
+    """Simulate realistic mouse movement patterns."""
+    import asyncio
+    # Random mouse movements
+    viewport = page.viewport_size or {'width': 1920, 'height': 1080}
+    x = random.randint(100, viewport['width'] - 100)
+    y = random.randint(100, viewport['height'] - 100)
+    # Move mouse with slight curve
+    page.mouse.move(x, y)
+
+
+def simulate_network_latency() -> float:
+    """Simulate realistic network latency based on connection type."""
+    # Simulate different connection types
+    connection_types = [
+        ('fast_4g', 20, 50),    # 20-50ms
+        ('slow_4g', 50, 150),   # 50-150ms
+        ('fast_3g', 100, 300),  # 100-300ms
+        ('slow_3g', 200, 500),  # 200-500ms
+    ]
+
+    conn_type, min_lat, max_lat = random.choice(connection_types)
+    # Add jitter and occasional spikes
+    base_latency = random.uniform(min_lat, max_lat)
+    jitter = random.uniform(-0.2, 0.2) * base_latency
+    spike = random.random() < 0.1  # 10% chance of latency spike
+
+    if spike:
+        base_latency *= (2 + random.random() * 3)  # 2-5x spike
+
+    return max(10, base_latency + jitter) / 1000  # Convert to seconds
+
+
+def exponential_backoff_with_jitter(attempt: int, base_delay: float = 1.0, max_delay: float = 60.0, jitter_factor: float = 0.1) -> float:
+    """Calculate exponential backoff delay with jitter to avoid thundering herd."""
+    # Exponential backoff: base_delay * (2 ^ (attempt - 1))
+    delay = base_delay * (2 ** (attempt - 1))
+    
+    # Cap at max_delay
+    delay = min(delay, max_delay)
+    
+    # Add jitter (±jitter_factor * delay)
+    jitter = random.uniform(-jitter_factor, jitter_factor) * delay
+    delay += jitter
+    
+    # Ensure minimum delay
+    return max(base_delay, delay)
+
+
+def generate_realistic_referer(current_url: str, page_num: int) -> Optional[str]:
+    """Generate a realistic referer URL for the current request."""
+    if page_num == 1:
+        # First page - could come from search engine or direct
+        referer_options = [
+            None,  # Direct access
+            'https://www.google.com/search?q=jobs',  # Google search
+            'https://www.bing.com/search?q=job+search',  # Bing search
+            'https://duckduckgo.com/?q=employment',  # DuckDuckGo
+            'https://www.linkedin.com/jobs',  # LinkedIn jobs
+            'https://indeed.com/',  # Indeed
+        ]
+        return random.choice(referer_options)
+    else:
+        # Subsequent pages - likely from previous page in pagination
+        parsed = urllib.parse.urlparse(current_url)
+        query = urllib.parse.parse_qs(parsed.query)
+        
+        # Modify page number to previous page
+        prev_page = page_num - 1
+        query['p'] = [str(prev_page)]
+        
+        prev_query = urllib.parse.urlencode({k: v[0] if isinstance(v, list) else v for k, v in query.items()})
+        prev_url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', prev_query, ''))
+        
+        return prev_url
+
+
+async def simulate_connection_warmup(page: Page) -> None:
+    """Simulate connection warmup and DNS resolution."""
+    # Simulate DNS lookup and connection establishment
+    await asyncio.sleep(simulate_network_latency() * 0.5)
+
+    # Simulate TCP handshake
+    await asyncio.sleep(simulate_network_latency() * 0.3)
+
+    # Simulate TLS handshake if HTTPS
+    if random.random() < 0.9:  # 90% of sites are HTTPS
+        await asyncio.sleep(simulate_network_latency() * 0.4)
+
+
+async def create_stealth_context(browser):
+    """Create a new browser context with stealth settings."""
+    context = await browser.new_context(
+        user_agent=get_random_user_agent(),
+        viewport={'width': 1920 + random.randint(-100, 100), 'height': 1080 + random.randint(-50, 50)},
+        locale=random.choice(['en-US', 'en-GB', 'en-CA']),
+        timezone_id=random.choice(['America/New_York', 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo']),
+        java_script_enabled=True,
+        accept_downloads=False,
+        bypass_csp=True,
+        ignore_https_errors=True,
+        # Randomize other properties
+        device_scale_factor=random.choice([1, 1.25, 1.5]),
+        is_mobile=random.random() < 0.1,  # 10% mobile
+        has_touch=random.random() < 0.15,  # 15% touch
+        # Enhanced stealth options
+        permissions=[],  # Block all permissions
+        geolocation=None,  # No geolocation
+        color_scheme='light',  # Force light mode
+        reduced_motion='no-preference',  # Normal motion
+        forced_colors=None,  # No forced colors
+    )
+
+    # Enhanced stealth script injection
+    await context.add_init_script("""
+        // Remove webdriver property
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+
+        // Mock plugins array with realistic values
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [
+                { name: 'Chrome PDF Plugin', description: 'Portable Document Format', filename: 'internal-pdf-viewer' },
+                { name: 'Chrome PDF Viewer', description: '', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                { name: 'Native Client', description: '', filename: 'internal-nacl-plugin' }
+            ]
+        });
+
+        // Mock languages with slight variations
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en', 'es']
+        });
+
+        // Enhanced chrome object
+        window.chrome = {
+            runtime: {
+                onConnect: undefined,
+                onMessage: undefined,
+                connect: function() { return {}; },
+                sendMessage: function() { return {}; }
+            },
+            csi: function() { return {}; },
+            loadTimes: function() { return {}; },
+            app: {
+                isInstalled: false
+            }
+        };
+
+        // Mock permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+
+        // Override screen properties to be more realistic
+        Object.defineProperty(screen, 'availTop', { value: 0 });
+        Object.defineProperty(screen, 'availLeft', { value: 0 });
+
+        // Mock hardware concurrency with variation
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => 4 + Math.floor(Math.random() * 12)  // Random between 4-16
+        });
+
+        // Mock device memory
+        Object.defineProperty(navigator, 'deviceMemory', {
+            get: () => [4, 8, 16][Math.floor(Math.random() * 3)]
+        });
+
+        // Remove automation indicators
+        delete window.callPhantom;
+        delete window._phantom;
+        delete window.__nightmare;
+        delete window._seleniumRunner;
+        delete window.__webdriver_script_fn;
+        delete window.__driver_evaluate;
+        delete window.__webdriver_evaluate;
+        delete window.__selenium_evaluate;
+        delete window.__fxdriver_evaluate;
+        delete window.__driver_unwrapped;
+        delete window.__selenium_unwrapped;
+        delete window.__fxdriver_unwrapped;
+
+        // Mock battery API
+        if (!navigator.getBattery) {
+            navigator.getBattery = () => Promise.resolve({
+                charging: Math.random() > 0.3,  // 70% chance charging
+                chargingTime: Math.random() * 3600,
+                dischargingTime: Math.random() * 7200,
+                level: 0.1 + Math.random() * 0.9  // 10-100%
+            });
+        }
+
+        // Mock connection API
+        if (!navigator.connection) {
+            navigator.connection = {
+                effectiveType: ['4g', '3g', 'slow-2g'][Math.floor(Math.random() * 3)],
+                rtt: 20 + Math.random() * 200,
+                downlink: 0.5 + Math.random() * 50
+            };
+        }
+
+        // Mock WebGL
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) { // UNMASKED_VENDOR_WEBGL
+                return 'Intel Inc.';
+            }
+            if (parameter === 37446) { // UNMASKED_RENDERER_WEBGL
+                return 'Intel(R) Iris(TM) Graphics 6100';
+            }
+            return getParameter.call(this, parameter);
+        };
+
+        // Mock canvas fingerprint randomization
+        const toDataURL = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function(...args) {
+            const result = toDataURL.apply(this, args);
+            // Add slight randomization to canvas fingerprint
+            return result.replace(/.$/, String.fromCharCode(Math.floor(Math.random() * 26) + 97));
+        };
+    """)
+
+    return context
 
 
 def absolute_url(base: str, href: str) -> str:
@@ -337,16 +613,25 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
 
     for attempt in range(1, max_attempts + 1):
         ua = get_random_user_agent()
+        client_hints = get_client_hints_for_ua(ua)
         # Set reasonable headers including User-Agent and Referer
-        headers = {'User-Agent': ua, 'Accept-Language': 'en-US,en;q=0.9'}
+        headers = {
+            'User-Agent': ua,
+            'Accept-Language': 'en-US,en;q=0.9',
+            **client_hints  # Add client hint headers
+        }
         if referer:
             headers['Referer'] = referer
 
         try:
-            # Slight random delay before attempt
-            await asyncio.sleep(random.uniform(0.5, 1.5) * attempt)
+            # Human-like delay before attempt with jitter
+            delay = human_like_delay(1.0, 4.0) * attempt  # Increase delay with attempts
+            await asyncio.sleep(delay)
 
             await page.set_extra_http_headers(headers)
+
+            # Simulate connection warmup before navigation
+            await simulate_connection_warmup(page)
 
             Actor.log.info(f'Attempt {attempt}/{max_attempts} fetching {url} with UA: {ua[:60]}')
             response = await page.goto(url, wait_until='domcontentloaded', timeout=30000)
@@ -370,8 +655,14 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
                         await Actor.set_value(f'fail_html_page_{page_num or "na"}_attempt_{attempt}.html', html_snip[:10000], content_type='text/html')
                     except Exception as e:
                         Actor.log.debug(f'Failed to save diagnostics: {e}')
-                # Try again with backoff
-                await asyncio.sleep(base_delay * attempt)
+                # Smart backoff based on status
+                if status == 429:
+                    # Rate limited - longer backoff
+                    backoff_delay = exponential_backoff_with_jitter(attempt, base_delay * 2, max_delay=60)
+                else:
+                    # Blocked - standard backoff
+                    backoff_delay = exponential_backoff_with_jitter(attempt, base_delay, max_delay=30)
+                await asyncio.sleep(backoff_delay)
                 continue
 
             if status >= 400:
@@ -385,7 +676,9 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
                     except Exception as e:
                         Actor.log.debug(f'Failed to save error snapshot: {e}')
                     return None
-                await asyncio.sleep(base_delay * attempt)
+                # Backoff for other errors
+                backoff_delay = exponential_backoff_with_jitter(attempt, base_delay, max_delay=20)
+                await asyncio.sleep(backoff_delay)
                 continue
 
             # Wait for job listing elements (best-effort)
@@ -394,16 +687,48 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
             except Exception as e:
                 Actor.log.debug(f'Wait for selector timed out: {e}')
 
-            # Simulate light scrolling
+            # Simulate human-like browsing behavior
             try:
-                await page.evaluate("""
-                    () => { window.scrollBy(0, window.innerHeight / 2); }
-                """)
-            except Exception:
-                pass
+                # Random mouse movement
+                viewport = page.viewport_size or {'width': 1920, 'height': 1080}
+                mouse_x = random.randint(200, viewport['width'] - 200)
+                mouse_y = random.randint(200, viewport['height'] - 200)
+                await page.mouse.move(mouse_x, mouse_y)
+
+                # Simulate reading time before scrolling
+                await asyncio.sleep(human_like_delay(2.0, 5.0))
+
+                # Natural scrolling pattern
+                scroll_steps = random.randint(2, 5)
+                for i in range(scroll_steps):
+                    scroll_amount = random.randint(200, 600)
+                    await page.evaluate(f"window.scrollBy(0, {scroll_amount});")
+                    await asyncio.sleep(human_like_delay(0.5, 2.0))
+
+                # Simulate more reading time
+                await asyncio.sleep(human_like_delay(1.0, 3.0))
+
+                # Random additional interactions
+                if random.random() < 0.3:  # 30% chance
+                    # Simulate hovering over a job listing
+                    try:
+                        job_elements = await page.query_selector_all('article, div[class*="job"]')
+                        if job_elements:
+                            random_job = random.choice(job_elements[:5])  # First 5 jobs
+                            box = await random_job.bounding_box()
+                            if box:
+                                await page.mouse.move(
+                                    box['x'] + box['width'] / 2,
+                                    box['y'] + box['height'] / 2
+                                )
+                                await asyncio.sleep(human_like_delay(0.5, 1.5))
+                    except Exception:
+                        pass
+            except Exception as e:
+                Actor.log.debug(f'Error during browsing simulation: {e}')
 
             # Final small delay to allow async content
-            await asyncio.sleep(random.uniform(1.0, 2.0))
+            await asyncio.sleep(human_like_delay(1.0, 2.5))
 
             html = await page.content()
             Actor.log.info(f'Successfully fetched {url} (len={len(html)}) on attempt {attempt}')
@@ -422,8 +747,9 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
                 except Exception as e2:
                     Actor.log.debug(f'Failed to save final diagnostics: {e2}')
                 return None
-            # Exponential backoff before retrying
-            await asyncio.sleep(base_delay * attempt)
+            # Exponential backoff before retrying with jitter
+            backoff_delay = exponential_backoff_with_jitter(attempt, base_delay, max_delay=15)
+            await asyncio.sleep(backoff_delay)
     return None
 
 
@@ -490,7 +816,7 @@ async def main() -> None:
 
         # Launch Playwright browser with stealth
         async with async_playwright() as p:
-            # Configure browser launch options
+            # Configure browser launch options with enhanced stealth
             launch_options = {
                 'headless': True,  # Run headless for server environment
                 'args': [
@@ -503,6 +829,54 @@ async def main() -> None:
                     '--disable-gpu',
                     '--disable-web-security',
                     '--disable-features=VizDisplayCompositor',
+                    '--disable-ipc-flooding-protection',
+                    '--disable-background-timer-throttling',
+                    '--disable-renderer-backgrounding',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-field-trial-config',
+                    '--disable-back-forward-cache',
+                    '--disable-hang-monitor',
+                    '--disable-prompt-on-repost',
+                    '--force-color-profile=srgb',
+                    '--metrics-recording-only',
+                    '--no-crash-upload',
+                    '--disable-logging',
+                    '--disable-login-animations',
+                    '--disable-notifications',
+                    '--disable-permissions-api',
+                    '--disable-session-crashed-bubble',
+                    '--disable-infobars',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-component-extensions-with-background-pages',
+                    '--disable-default-apps',
+                    '--disable-extensions',
+                    '--disable-extensions-except',
+                    '--disable-extensions-file-access-check',
+                    '--disable-extensions-http-throttling',
+                    '--disable-features=TranslateUI',
+                    '--disable-features=BlinkGenPropertyTrees',
+                    '--no-default-browser-check',
+                    '--no-first-run',
+                    '--mute-audio',
+                    '--disable-sync',
+                    '--disable-translate',
+                    '--hide-scrollbars',
+                    '--metrics-recording-only',
+                    '--no-crash-upload',
+                    '--disable-component-update',
+                    '--disable-domain-reliability',
+                    '--disable-client-side-phishing-detection',
+                    '--disable-background-networking',
+                    '--disable-breakpad',
+                    '--disable-component-extensions-with-background-pages',
+                    '--disable-features=OptimizationHints',
+                    '--disable-features=OptimizationGuideModelDownloading',
+                    '--disable-features=OptimizationGuideModelStore',
+                    '--disable-features=OptimizationGuidePersonalizedSuggestions',
+                    '--disable-features=OptimizationGuideDebugLogs',
+                    '--disable-features=HeavyAdPrivacyMitigations',
+                    '--disable-features=HeavyAdIntervention',
+                    '--user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"',
                 ]
             }
             
@@ -542,49 +916,9 @@ async def main() -> None:
             
             browser = await p.chromium.launch(**launch_options)
             
-            # Create browser context with stealth and realistic settings
-            context = await browser.new_context(
-                user_agent=get_random_user_agent(),
-                viewport={'width': 1920, 'height': 1080},
-                locale='en-US',
-                timezone_id='America/New_York',
-                # Add more realistic browser features
-                java_script_enabled=True,
-                accept_downloads=False,
-                bypass_csp=True,
-                ignore_https_errors=True,
-            )
-            
-            # Inject scripts to avoid detection
-            await context.add_init_script("""
-                // Overwrite the `plugins` property to use a custom getter
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-                
-                // Overwrite the `plugins` property
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-                
-                // Overwrite the `languages` property
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-                
-                // Mock chrome object
-                window.chrome = {
-                    runtime: {}
-                };
-                
-                // Mock permissions
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
-            """)
+            # Create initial browser context with stealth and realistic settings
+            context = await create_stealth_context(browser)
+            page = await context.new_page()
             
             page = await context.new_page()
 
@@ -611,13 +945,17 @@ async def main() -> None:
             page.on('console', _on_console)
             page.on('response', _on_response)
 
-            # Set additional headers to mimic real browser
+            # Set additional headers to mimic real browser (remove DNT as it's a bot signature)
             await page.set_extra_http_headers({
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
                 'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
             })
 
             # Quick connectivity health checks to help debug network blocking
@@ -643,17 +981,52 @@ async def main() -> None:
                 # Skip AJAX for now, as Playwright handles dynamic content
                 # If needed, can add back later
                 
+                session_page_count = 0
+                max_pages_per_session = random.randint(3, 8)  # Rotate session every 3-8 pages
+                
                 for page_num in range(1, max_pages + 1):
+                    # Rotate session if needed
+                    if session_page_count >= max_pages_per_session:
+                        Actor.log.info(f'Rotating session after {session_page_count} pages')
+                        await context.close()
+                        context = await create_stealth_context(browser)
+                        page = await context.new_page()
+                        # Re-attach event handlers
+                        page.on('requestfailed', _on_request_failed)
+                        page.on('console', _on_console)
+                        page.on('response', _on_response)
+                        # Re-set headers
+                        await page.set_extra_http_headers({
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'Upgrade-Insecure-Requests': '1',
+                            'Sec-Fetch-Dest': 'document',
+                            'Sec-Fetch-Mode': 'navigate',
+                            'Sec-Fetch-Site': 'none',
+                            'Sec-Fetch-User': '?1',
+                            'Cache-Control': 'max-age=0',
+                        })
+                        session_page_count = 0
+                        max_pages_per_session = random.randint(3, 8)
+                        # Clear cookies and local storage
+                        await context.clear_cookies()
+                        await page.evaluate("localStorage.clear(); sessionStorage.clear();")
+                    
                     url = page_url(page_num)
                     Actor.log.info(f'Scraping search page {page_num}: {url}')
 
-                    html = await fetch_search_page(page, url, referer=referer_url, page_num=page_num)
-                    referer_url = url
+                    # Generate realistic referer
+                    referer = generate_realistic_referer(url, page_num)
+
+                    html = await fetch_search_page(page, url, referer=referer, page_num=page_num)
+                    referer_url = url  # Update for next iteration
                     if not html:
                         Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')
                         break
 
                     soup = BeautifulSoup(html, 'lxml')
+                    session_page_count += 1
 
                 
                     # Extract jobs using hybrid approach
@@ -721,6 +1094,12 @@ async def main() -> None:
                     if max_jobs > 0 and total_pushed >= max_jobs:
                         Actor.log.info(f'Reached maxJobs limit ({max_jobs}). Stopping.')
                         break
+
+                    # Add pacing between pages to avoid rate limiting
+                    if page_num < max_pages:
+                        page_delay = human_like_delay(3.0, 8.0)  # 3-8 seconds between pages
+                        Actor.log.debug(f'Pacing: waiting {page_delay:.1f}s before next page')
+                        await asyncio.sleep(page_delay)
 
             finally:
                 await browser.close()
