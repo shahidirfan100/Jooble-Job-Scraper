@@ -25,9 +25,9 @@ DEFAULT_MAX_PAGES = 1
 DEFAULT_MAX_JOBS = 0
 CLOUDFLARE_CHALLENGE_TIMEOUT = 45000  # 45 seconds for CF challenge
 TURNSTILE_CHALLENGE_TIMEOUT = 40000  # 40 seconds for Turnstile
-DETAIL_FETCH_TIMEOUT = 35000
-DETAIL_MAX_ATTEMPTS = 2
-DETAIL_CONCURRENCY = 3
+DETAIL_FETCH_TIMEOUT = 45000
+DETAIL_MAX_ATTEMPTS = 3
+DETAIL_CONCURRENCY = 2
 
 # --- Helper Functions ---
 
@@ -237,19 +237,12 @@ def select_first_text(container: Tag, selectors: List[str]) -> Optional[str]:
 
 
 def is_internal_detail_url(job_url: Optional[str]) -> bool:
-    """Return True if URL points to a Jooble-hosted detail page (not external redirect)."""
+    """Return True if URL stays on Jooble's domain (including redirect endpoints)."""
     if not job_url:
         return False
     parsed = urlparse(job_url)
-    if not parsed.netloc:
-        return False
-    hostname = parsed.netloc.lower()
-    path = (parsed.path or '').lower()
-    if 'jooble' not in hostname:
-        return False
-    if '/redirect' in path or '/out/' in path:
-        return False
-    return True
+    hostname = (parsed.netloc or '').lower()
+    return bool(hostname and 'jooble' in hostname)
 
 
 def merge_detail_fields(base_item: Dict[str, Any], detail_data: Dict[str, Any]) -> None:
@@ -350,37 +343,98 @@ def parse_detail_page(html: str) -> Dict[str, Optional[str]]:
 
 
 async def fetch_job_detail_html(context, job_url: str, referer: Optional[str] = None, label: str = '') -> Optional[str]:
-    """Fetch a job detail page using a lightweight Playwright page."""
+    """Fetch a job detail page with Playwright, handling basic anti-bot checks."""
     for attempt in range(1, DETAIL_MAX_ATTEMPTS + 1):
         page: Optional[Page] = None
+        ua = get_random_user_agent()
         try:
             page = await context.new_page()
             headers = {
-                'User-Agent': get_random_user_agent(),
+                'User-Agent': ua,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+                'Pragma': 'no-cache',
+                'Cache-Control': 'no-cache',
             }
             if referer:
                 headers['Referer'] = referer
             await page.set_extra_http_headers(headers)
             await simulate_connection_warmup(page)
-            Actor.log.debug(f'Fetching detail page (attempt {attempt}/{DETAIL_MAX_ATTEMPTS}) {label} -> {job_url}')
+
+            # Lightweight human-like signals
+            viewport = page.viewport_size or {'width': 1920, 'height': 1080}
+            await page.mouse.move(
+                random.randint(100, viewport['width'] - 100),
+                random.randint(100, viewport['height'] - 100),
+            )
+
+            Actor.log.debug(f'[{label}] Detail fetch attempt {attempt}/{DETAIL_MAX_ATTEMPTS}: {job_url}')
             response = await page.goto(job_url, wait_until='domcontentloaded', timeout=DETAIL_FETCH_TIMEOUT)
-            status = response.status if response else 'no-response'
-            if response and response.status == 200:
-                await asyncio.sleep(human_like_delay(0.4, 1.2))
-                html = await page.content()
+            if not response:
+                raise RuntimeError('No response from detail page')
+
+            final_url = response.url or job_url
+            status = response.status
+            Actor.log.debug(f'[{label}] Detail status {status} ({final_url})')
+
+            if status in (403, 429):
+                Actor.log.warning(f'[{label}] Detail blocked with {status}, trying to wait for challenge...')
+                try:
+                    await page.wait_for_function(
+                        '''() => {
+                            const cf = document.querySelector('[data-sitekey], #challenge-form, .cf-challenge');
+                            return !cf;
+                        }''',
+                        timeout=TURNSTILE_CHALLENGE_TIMEOUT,
+                    )
+                    Actor.log.info(f'[{label}] Challenge cleared, reloading detail page...')
+                    response = await page.goto(job_url, wait_until='domcontentloaded', timeout=DETAIL_FETCH_TIMEOUT)
+                    status = response.status if response else None
+                    final_url = response.url if response else final_url
+                except Exception as e:
+                    Actor.log.debug(f'[{label}] Challenge handling failed: {e}')
+
+            if status and status >= 400:
+                raise RuntimeError(f'HTTP {status} on detail url {final_url}')
+
+            # If redirect leaves Jooble, skip enrichment
+            if 'jooble' not in urlparse(final_url).netloc.lower():
+                Actor.log.debug(f'[{label}] Detail redirected outside Jooble ({final_url}), skipping.')
+                return None
+
+            try:
+                await page.wait_for_selector('[data-test-name="job-description"], article, main', timeout=8000)
+            except Exception:
+                pass
+
+            # Small scrolls help rendering lazy sections
+            scroll_steps = random.randint(1, 3)
+            for _ in range(scroll_steps):
+                await page.evaluate("window.scrollBy(0, arguments[0]);", random.randint(300, 600))
+                await asyncio.sleep(human_like_delay(0.2, 0.8))
+
+            await asyncio.sleep(human_like_delay(0.5, 1.5))
+            html = await page.content()
+            if html:
+                Actor.log.debug(f'[{label}] Detail HTML length {len(html)}')
                 return html
-            Actor.log.debug(f'Detail page status {status} for {job_url}')
         except Exception as e:
-            Actor.log.debug(f'Detail fetch error for {job_url}: {e}')
+            Actor.log.debug(f'[{label}] Detail fetch error: {e}')
         finally:
             if page:
                 try:
                     await page.close()
                 except Exception:
                     pass
-        backoff = exponential_backoff_with_jitter(attempt, base_delay=1.5, max_delay=8.0)
+
+        backoff = exponential_backoff_with_jitter(attempt, base_delay=2.0, max_delay=12.0)
         await asyncio.sleep(backoff)
+
+    Actor.log.debug(f'[{label}] Detail fetch exhausted attempts for {job_url}')
     return None
 
 
@@ -403,6 +457,7 @@ async def enrich_jobs_with_details(context, job_items: List[Dict[str, Any]], ref
                 html = await fetch_job_detail_html(context, job_url, referer=referer, label=f'job#{idx + 1}')
 
             if not html:
+                Actor.log.debug(f'Job detail unavailable for {job_url}')
                 results[idx] = item
                 return
 
