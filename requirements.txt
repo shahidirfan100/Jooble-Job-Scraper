@@ -2,4 +2,3 @@ apify<4.0.0
 playwright
 beautifulsoup4
 lxml
-httpx

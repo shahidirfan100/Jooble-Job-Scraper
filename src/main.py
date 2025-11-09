@@ -16,6 +16,14 @@ from bs4 import BeautifulSoup, Tag
 from playwright.async_api import async_playwright, Page
 from apify import Actor
 
+# --- Constants ---
+MAX_RETRY_ATTEMPTS = 3
+BASE_RETRY_DELAY = 2.0
+MAX_BACKOFF_DELAY = 60.0
+FETCH_MAX_BACKOFF_DELAY = 30.0  # Shorter delay for page fetches
+DEFAULT_MAX_PAGES = 1
+DEFAULT_MAX_JOBS = 0
+
 # --- Helper Functions ---
 
 def get_random_user_agent():
@@ -64,28 +72,6 @@ def human_like_delay(min_seconds: float = 0.5, max_seconds: float = 3.0) -> floa
     u = random.random()
     delay = min_seconds + (max_seconds - min_seconds) * (u ** (1/(alpha+beta_param-1)))
     return delay
-
-
-def simulate_reading_time(text_length: int) -> float:
-    """Simulate reading time based on text length (words per minute)."""
-    if text_length <= 0:
-        return 0
-    words_per_minute = 200 + random.randint(-50, 50)  # 150-250 WPM
-    estimated_words = text_length / 5  # rough estimate
-    reading_time = (estimated_words / words_per_minute) * 60
-    # Add some jitter and minimum time
-    return max(0.5, reading_time * (0.8 + random.random() * 0.4))
-
-
-def simulate_mouse_movement(page: Page) -> None:
-    """Simulate realistic mouse movement patterns."""
-    import asyncio
-    # Random mouse movements
-    viewport = page.viewport_size or {'width': 1920, 'height': 1080}
-    x = random.randint(100, viewport['width'] - 100)
-    y = random.randint(100, viewport['height'] - 100)
-    # Move mouse with slight curve
-    page.mouse.move(x, y)
 
 
 def simulate_network_latency() -> float:
@@ -208,7 +194,7 @@ async def create_stealth_context(browser):
 
         // Mock languages with slight variations
         Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en', 'es']
+            get: () => ['en-US', 'en']
         });
 
         // Enhanced chrome object
@@ -234,13 +220,9 @@ async def create_stealth_context(browser):
                 originalQuery(parameters)
         );
 
-        // Override screen properties to be more realistic
-        Object.defineProperty(screen, 'availTop', { value: 0 });
-        Object.defineProperty(screen, 'availLeft', { value: 0 });
-
         // Mock hardware concurrency with variation
         Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 4 + Math.floor(Math.random() * 12)  // Random between 4-16
+            get: () => 4 + Math.floor(Math.random() * 8)  // Random between 4-12
         });
 
         // Mock device memory
@@ -271,35 +253,6 @@ async def create_stealth_context(browser):
                 level: 0.1 + Math.random() * 0.9  // 10-100%
             });
         }
-
-        // Mock connection API
-        if (!navigator.connection) {
-            navigator.connection = {
-                effectiveType: ['4g', '3g', 'slow-2g'][Math.floor(Math.random() * 3)],
-                rtt: 20 + Math.random() * 200,
-                downlink: 0.5 + Math.random() * 50
-            };
-        }
-
-        // Mock WebGL
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) { // UNMASKED_VENDOR_WEBGL
-                return 'Intel Inc.';
-            }
-            if (parameter === 37446) { // UNMASKED_RENDERER_WEBGL
-                return 'Intel(R) Iris(TM) Graphics 6100';
-            }
-            return getParameter.call(this, parameter);
-        };
-
-        // Mock canvas fingerprint randomization
-        const toDataURL = HTMLCanvasElement.prototype.toDataURL;
-        HTMLCanvasElement.prototype.toDataURL = function(...args) {
-            const result = toDataURL.apply(this, args);
-            // Add slight randomization to canvas fingerprint
-            return result.replace(/.$/, String.fromCharCode(Math.floor(Math.random() * 26) + 97));
-        };
     """)
 
     return context
@@ -323,22 +276,6 @@ def select_first_text(container: Tag, selectors: List[str]) -> Optional[str]:
                 text = elem.get_text(strip=True)
                 if text:
                     return text
-        except Exception:
-            continue
-    return None
-
-
-def select_first_html(container: Tag, selectors: List[str]) -> Optional[str]:
-    """Try multiple selectors and return first non-empty HTML."""
-    if not container:
-        return None
-    for selector in selectors:
-        try:
-            elem = container.select_one(selector)
-            if elem:
-                html = str(elem)
-                if html:
-                    return html
         except Exception:
             continue
     return None
@@ -608,8 +545,8 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
     This function will try multiple attempts with exponential backoff, rotate user-agents,
     and on final failure save a screenshot and HTML snippet to Key-Value store for debugging.
     """
-    max_attempts = 3
-    base_delay = 2.0
+    max_attempts = MAX_RETRY_ATTEMPTS
+    base_delay = BASE_RETRY_DELAY
 
     for attempt in range(1, max_attempts + 1):
         ua = get_random_user_agent()
@@ -661,7 +598,7 @@ async def fetch_search_page(page: Page, url: str, referer: Optional[str] = None,
                     backoff_delay = exponential_backoff_with_jitter(attempt, base_delay * 2, max_delay=60)
                 else:
                     # Blocked - standard backoff
-                    backoff_delay = exponential_backoff_with_jitter(attempt, base_delay, max_delay=30)
+                    backoff_delay = exponential_backoff_with_jitter(attempt, base_delay, max_delay=FETCH_MAX_BACKOFF_DELAY)
                 await asyncio.sleep(backoff_delay)
                 continue
 
@@ -761,14 +698,13 @@ async def main() -> None:
         keyword: str = (actor_input.get('keyword') or actor_input.get('ukw') or '').strip()
         # Region is optional for Jooble; empty means global or site default
         region: str = (actor_input.get('region') or actor_input.get('rgns') or '').strip()
-        max_pages: int = int(actor_input.get('max_pages') or 1)
+        max_pages: int = int(actor_input.get('max_pages') or DEFAULT_MAX_PAGES)
         start_url: Optional[str] = (actor_input.get('startUrl') or '').strip() or None
-        max_jobs: int = int(actor_input.get('maxJobs') or 0)
+        max_jobs: int = int(actor_input.get('maxJobs') or DEFAULT_MAX_JOBS)
         
         # Get proxy configuration
         proxy_config = actor_input.get('proxyConfiguration')
         proxy_url = None
-        effective_proxy: Optional[str] = None
         
         if proxy_config:
             use_apify_proxy = proxy_config.get('useApifyProxy', False)
@@ -816,7 +752,7 @@ async def main() -> None:
 
         # Launch Playwright browser with stealth
         async with async_playwright() as p:
-            # Configure browser launch options with enhanced stealth
+            # Configure browser launch options with balanced stealth
             launch_options = {
                 'headless': True,  # Run headless for server environment
                 'args': [
@@ -829,58 +765,33 @@ async def main() -> None:
                     '--disable-gpu',
                     '--disable-web-security',
                     '--disable-features=VizDisplayCompositor',
-                    '--disable-ipc-flooding-protection',
+                    '--disable-blink-features=AutomationControlled',
                     '--disable-background-timer-throttling',
-                    '--disable-renderer-backgrounding',
                     '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
                     '--disable-field-trial-config',
-                    '--disable-back-forward-cache',
                     '--disable-hang-monitor',
                     '--disable-prompt-on-repost',
-                    '--force-color-profile=srgb',
-                    '--metrics-recording-only',
-                    '--no-crash-upload',
-                    '--disable-logging',
-                    '--disable-login-animations',
-                    '--disable-notifications',
-                    '--disable-permissions-api',
-                    '--disable-session-crashed-bubble',
                     '--disable-infobars',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-component-extensions-with-background-pages',
-                    '--disable-default-apps',
                     '--disable-extensions',
-                    '--disable-extensions-except',
-                    '--disable-extensions-file-access-check',
-                    '--disable-extensions-http-throttling',
-                    '--disable-features=TranslateUI',
-                    '--disable-features=BlinkGenPropertyTrees',
                     '--no-default-browser-check',
-                    '--no-first-run',
                     '--mute-audio',
                     '--disable-sync',
                     '--disable-translate',
                     '--hide-scrollbars',
                     '--metrics-recording-only',
                     '--no-crash-upload',
+                    '--disable-logging',
+                    '--disable-login-animations',
+                    '--disable-notifications',
                     '--disable-component-update',
-                    '--disable-domain-reliability',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-background-networking',
-                    '--disable-breakpad',
-                    '--disable-component-extensions-with-background-pages',
-                    '--disable-features=OptimizationHints',
-                    '--disable-features=OptimizationGuideModelDownloading',
-                    '--disable-features=OptimizationGuideModelStore',
-                    '--disable-features=OptimizationGuidePersonalizedSuggestions',
-                    '--disable-features=OptimizationGuideDebugLogs',
-                    '--disable-features=HeavyAdPrivacyMitigations',
-                    '--disable-features=HeavyAdIntervention',
+                    # Keep user agent override but not too restrictive
                     '--user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"',
                 ]
             }
             
             # Add proxy if configured
+            proxy_configured = False
             if proxy_url:
                 try:
                     # Resolve proxy string (ProxyConfiguration has new_url())
@@ -910,16 +821,16 @@ async def main() -> None:
                             proxy_option['password'] = urllib.parse.unquote(password)
 
                         launch_options['proxy'] = proxy_option
+                        proxy_configured = True
                         Actor.log.info(f'Configured browser with proxy server={server} user={bool(username)}')
                 except Exception as e:
                     Actor.log.error(f'Failed to configure proxy for Playwright: {e}')
+                    Actor.log.info('Continuing without proxy...')
             
             browser = await p.chromium.launch(**launch_options)
             
             # Create initial browser context with stealth and realistic settings
             context = await create_stealth_context(browser)
-            page = await context.new_page()
-            
             page = await context.new_page()
 
             # Network and console event handlers for debugging connectivity
@@ -958,7 +869,7 @@ async def main() -> None:
                 'Cache-Control': 'max-age=0',
             })
 
-            # Quick connectivity health checks to help debug network blocking
+            # Quick connectivity health checks (non-blocking)
             try:
                 health = await page.goto('https://example.com', wait_until='domcontentloaded', timeout=20000)
                 Actor.log.info(f'Health check example.com status: {health.status if health else "no-response"}')
@@ -974,8 +885,39 @@ async def main() -> None:
                         await Actor.set_value('jooble_root_snippet', txt[:2000], content_type='text/plain')
                     except Exception:
                         pass
+                elif jooble_health and jooble_health.status == 403:
+                    Actor.log.warning('Jooble returned 403 on health check - this may indicate blocking, but continuing...')
             except Exception as e:
                 Actor.log.warning(f'Jooble health check failed: {e}')
+
+            # If proxy was configured but health checks are failing, try without proxy
+            if proxy_configured and (not health or health.status != 200):
+                Actor.log.warning('Proxy may be causing connectivity issues, attempting to continue without proxy...')
+                try:
+                    # Create new browser context without proxy
+                    await context.close()
+                    context = await create_stealth_context(browser)
+                    page = await context.new_page()
+                    # Re-attach event handlers
+                    page.on('requestfailed', _on_request_failed)
+                    page.on('console', _on_console)
+                    page.on('response', _on_response)
+                    # Re-set headers
+                    await page.set_extra_http_headers({
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Upgrade-Insecure-Requests': '1',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Cache-Control': 'max-age=0',
+                    })
+                    proxy_configured = False
+                    Actor.log.info('Switched to direct connection (no proxy)')
+                except Exception as e:
+                    Actor.log.error(f'Failed to create non-proxy context: {e}')
             
             try:
                 # Skip AJAX for now, as Playwright handles dynamic content
@@ -1022,74 +964,88 @@ async def main() -> None:
                     html = await fetch_search_page(page, url, referer=referer, page_num=page_num)
                     referer_url = url  # Update for next iteration
                     if not html:
-                        Actor.log.warning(f'Empty HTML for {url}, stopping pagination.')
-                        break
+                        Actor.log.warning(f'Failed to fetch HTML for {url}, attempting to continue with next page...')
+                        continue  # Continue to next page instead of breaking
 
                     soup = BeautifulSoup(html, 'lxml')
                     session_page_count += 1
 
-                
-                    # Extract jobs using hybrid approach
-                    blocks = extract_job_blocks(soup)
-                    Actor.log.info(f'Found {len(blocks)} job blocks on page {page_num}')
+                    # Extract jobs using hybrid approach with error handling
+                    try:
+                        blocks = extract_job_blocks(soup)
+                        Actor.log.info(f'Found {len(blocks)} job blocks on page {page_num}')
 
-                    new_items_on_page = 0
-                    
-                    # Try parsing job blocks first
-                    for block in blocks:
-                        item = parse_job_block(block, page_url=url)
-                        if not item:
-                            continue
-                        job_url = item.get('job_url')
-                        if job_url and job_url in seen_urls:
-                            continue
+                        new_items_on_page = 0
 
-                        # Enrich with metadata
-                        item['source_url'] = url
-                        item['page_number'] = page_num
-                        await Actor.push_data(item)
-                        total_pushed += 1
-                        new_items_on_page += 1
-                        if job_url:
-                            seen_urls.add(job_url)
+                        # Try parsing job blocks first
+                        for block in blocks:
+                            try:
+                                item = parse_job_block(block, page_url=url)
+                                if not item:
+                                    continue
+                                job_url = item.get('job_url')
+                                if job_url and job_url in seen_urls:
+                                    continue
 
-                    # Fallback: Try JSON-LD if no blocks found
-                    if new_items_on_page == 0:
-                        Actor.log.info('No jobs from blocks, trying JSON-LD extraction')
-                        ld_jobs = extract_jobs_from_ld_json(soup)
-                        for item in ld_jobs:
-                            job_url = item.get('job_url')
-                            if job_url and job_url in seen_urls:
+                                # Enrich with metadata
+                                item['source_url'] = url
+                                item['page_number'] = page_num
+                                await Actor.push_data(item)
+                                total_pushed += 1
+                                new_items_on_page += 1
+                                if job_url:
+                                    seen_urls.add(job_url)
+                            except Exception as e:
+                                Actor.log.debug(f'Error parsing job block: {e}')
                                 continue
-                            item['source_url'] = url
-                            item['page_number'] = page_num
-                            await Actor.push_data(item)
-                            total_pushed += 1
-                            new_items_on_page += 1
-                            if job_url:
-                                seen_urls.add(job_url)
 
-                    # Last resort: Direct link extraction
-                    if new_items_on_page == 0:
-                        Actor.log.info('No jobs from JSON-LD, trying direct link extraction')
-                        link_jobs = extract_jobs_from_links(soup, page_url=url)
-                        for item in link_jobs:
-                            job_url = item.get('job_url')
-                            if job_url and job_url in seen_urls:
-                                continue
-                            item['source_url'] = url
-                            item['page_number'] = page_num
-                            await Actor.push_data(item)
-                            total_pushed += 1
-                            new_items_on_page += 1
-                            if job_url:
-                                seen_urls.add(job_url)
+                        # Fallback: Try JSON-LD if no blocks found
+                        if new_items_on_page == 0:
+                            try:
+                                Actor.log.info('No jobs from blocks, trying JSON-LD extraction')
+                                ld_jobs = extract_jobs_from_ld_json(soup)
+                                for item in ld_jobs:
+                                    job_url = item.get('job_url')
+                                    if job_url and job_url in seen_urls:
+                                        continue
+                                    item['source_url'] = url
+                                    item['page_number'] = page_num
+                                    await Actor.push_data(item)
+                                    total_pushed += 1
+                                    new_items_on_page += 1
+                                    if job_url:
+                                        seen_urls.add(job_url)
+                            except Exception as e:
+                                Actor.log.debug(f'Error extracting JSON-LD jobs: {e}')
 
-                    Actor.log.info(f'Page {page_num}: pushed {new_items_on_page} new items (total {total_pushed}).')
+                        # Last resort: Direct link extraction
+                        if new_items_on_page == 0:
+                            try:
+                                Actor.log.info('No jobs from JSON-LD, trying direct link extraction')
+                                link_jobs = extract_jobs_from_links(soup, page_url=url)
+                                for item in link_jobs:
+                                    job_url = item.get('job_url')
+                                    if job_url and job_url in seen_urls:
+                                        continue
+                                    item['source_url'] = url
+                                    item['page_number'] = page_num
+                                    await Actor.push_data(item)
+                                    total_pushed += 1
+                                    new_items_on_page += 1
+                                    if job_url:
+                                        seen_urls.add(job_url)
+                            except Exception as e:
+                                Actor.log.debug(f'Error extracting link jobs: {e}')
 
-                    if new_items_on_page == 0:
-                        Actor.log.info('No jobs found on this page, stopping pagination.')
-                        break
+                        Actor.log.info(f'Page {page_num}: pushed {new_items_on_page} new items (total {total_pushed}).')
+
+                        if new_items_on_page == 0:
+                            Actor.log.info('No jobs found on this page, continuing to next page...')
+                            # Don't break, continue to next page
+
+                    except Exception as e:
+                        Actor.log.warning(f'Error processing page {page_num}: {e}')
+                        continue  # Continue to next page
 
                     if max_jobs > 0 and total_pushed >= max_jobs:
                         Actor.log.info(f'Reached maxJobs limit ({max_jobs}). Stopping.')
